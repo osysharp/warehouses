@@ -1,0 +1,30 @@
+namespace Osysharp.Warehouses.Snowflake;
+
+/// The body of a request to Snowflake's SQL API that runs one statement. A setting left null is not sent, so the
+/// user's default warehouse, database, schema or role applies.
+public class SnowflakeStatementRequest {
+  [ExternalName("statement")] public string Statement = "";
+  /// Seconds Snowflake lets the statement run before it cancels it.
+  [ExternalName("timeout")] public int Timeout;
+  [ExternalName("warehouse")] public string? Warehouse;
+  [ExternalName("database")] public string? Database;
+  [ExternalName("schema")] public string? Schema;
+  [ExternalName("role")] public string? Role;
+  /// The bound values, keyed by their position in the statement, counting from "1". Null when the statement binds none.
+  [ExternalName("bindings")] public Dictionary<string, SnowflakeBinding>? Bindings;
+}
+
+/// A key-pair JWT's header, as Snowflake requires it.
+public class SnowflakeJwtHeader {
+  [ExternalName("alg")] public string Algorithm = "RS256";
+  [ExternalName("typ")] public string Type = "JWT";
+}
+
+/// A key-pair JWT's claims: who it is issued for — the account, the user and the fingerprint of their public key — and
+/// when it is valid, in seconds since the Unix epoch.
+public class SnowflakeJwtClaims {
+  [ExternalName("iss")] public string Issuer = "";
+  [ExternalName("sub")] public string Subject = "";
+  [ExternalName("iat")] public long IssuedAt;
+  [ExternalName("exp")] public long ExpiresAt;
+}

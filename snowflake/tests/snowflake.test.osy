@@ -1,0 +1,80 @@
+// Osysharp.Warehouses.Snowflake — what an app's query becomes on the wire: one statement posted to the account's SQL API,
+// signed with a key-pair JWT made from the app's private key, and Snowflake's answer read back as the value the query
+// asked for.
+
+using Osysharp.Http;
+
+/// A throwaway RSA key made for this test app alone — it signs the test's JWTs and nothing else. In a real app the user's
+/// key is set once with `osy secret set SnowflakePrivateKey`, as PEM.
+string TestKey() {
+  return
+    "-----BEGIN PRIVATE KEY-----\n" +
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC8CaCR9yfLzKqA\n" +
+    "kFZt0Xw2XDNmq0oxYzHtSj5+5JTWjsxNmPnmMHjX19IUfGJG17cRO1XWEXeetYNs\n" +
+    "6/c554YvsRrZnhq4G1Ss+OMih7zb2fTPLAsvLDKqcHo6ytnH9IKXVlj92qiBd4En\n" +
+    "k29wXdBNwf0qGEAxtS25j+H9SqDRYVbD91+3CSU9Ql4Co8ejETLy8aSlu9y7x9SI\n" +
+    "rCXvbJpgkrir9Y/vBJIDOxvzlDMgYpBYQ1gpLSfA7jzubEkiiKdGTxBX9Tm+G7IM\n" +
+    "tmmyxRsVhUb2M+KOPVoMh/qfLJoHG9PuvJh0W8p9jeI44Z4mi1DR9+8bbHleteUL\n" +
+    "d7CX8cwVAgMBAAECggEANEZq5Nl0r1Q1PGukE4CvCv/D7HGHPUap7SF8UVOjyyhE\n" +
+    "xPfX1XY5Siw+Q6K2waIby0cXHF2bxzwIDwJkpyzl4aFXaRNqsy8p8bJ5lrJsvyQP\n" +
+    "Sn8gltsvNLHzUR/uvoeLvJ3tPJmKyf9aoRF8ZB04mT1qb8bxJcCMNy+4cG3MWpi+\n" +
+    "gZ9fgMhV1F59nAEUUchymyakAwd91DMgkRTkHt9ZF2VDRM0l+9sUXHDgP+8yT0Oa\n" +
+    "/0tIrdaBk96bc+F0RENow6Mcg5w4CjLWInKo3J6g7IHd7RAOPdSYhWDmz1NHtZJl\n" +
+    "2oJ6/wHGeWlDVKOgjVXQq+mmG9F3hgEOf/hM3QGQSwKBgQDeK6zsZoywAN391uMH\n" +
+    "vlt+fiJWWUy/ZZMGBVNgVDWygPlffOunhTwTjI+kTLr+7ModhKCf+FP7qNNhj2Rc\n" +
+    "cL8Io9gl6p/+Ybqr0Go6ky6vHI3zMdiayyaqfcq0FqQBgpZuAcGuYiv/ouIlQzsw\n" +
+    "BB42NA5XCEEXY9GASFNJ+HaF5wKBgQDYq24IVC1CM0L0uVHlzC4i9UJsI+d7w1N2\n" +
+    "Q3qlToEPTcYltRs4uJDJRvTqajvUpF56XACizbzjlhqD4jJ9Wi2I+0goyCIrO0p5\n" +
+    "nD819Ikr0kJGigKzBWPVjvyAeAz2Kznq+YtAfbw+yQ4De3imVqmFzP/fFNrBBUZO\n" +
+    "niKONsvmowKBgQClFTz7t8OIMEzDhj3SDi88EYuAMACoI1iY27I1XL09szoZKuCL\n" +
+    "7KNUP1iok99K9zXDsz4LP+FfmPXgg0Tmr1wzllNQ8UMLKSEk88tLVPwWYBhWAc7a\n" +
+    "TmOfwbKyGDSrbpZKjYGWCxp4bFavq4I6ToUIb6vMHbUIJUKRmKxSxY2ENwKBgCFp\n" +
+    "Pgx2vovoz7hhI2nmNG8bluSKHNYO5r3j5fO7yVcMzTNfXBVBEMKY+Id1XkiKGC+S\n" +
+    "JF72jtwhd3FC3jpKP59R8Gypf+tetztNhsnRLZ3eTG4INiZY/G4gIHvHB2imfcXo\n" +
+    "OTr2qKKd6lVLIu2zi2ygkgxacOk24QKajAWWGZc1AoGAQszvRHpVEomMQxbNoEOa\n" +
+    "XpLfoz/rJBMRGRjm1ODEFCyYKwvEzJeqzBoynzbJiR9wVCLB7gPG6a3ijMuXFZuO\n" +
+    "xLWeiLEk2jcGkTNaX1FBLXvBxdys2a/k+eufnXN+dSIEm62a7TLT5KD4njBpvuSn\n" +
+    "Fk9u/rzCbk4HbuNNnM924k0=\n" +
+    "-----END PRIVATE KEY-----\n";
+}
+
+/// Snowflake's answer to a statement that has finished: one column, one row.
+string Finished(string column, string value) {
+  return "{\"code\":\"090001\",\"message\":\"Statement executed successfully.\",\"statementHandle\":\"01b-test\","
+    + "\"resultSetMetaData\":{\"numRows\":1,\"format\":\"jsonv2\",\"rowType\":[{\"name\":\"" + column + "\",\"type\":\"fixed\","
+    + "\"nullable\":false}],\"partitionInfo\":[{\"rowCount\":1}]},\"data\":[[\"" + value + "\"]]}";
+}
+
+[TestFixture]
+void Account() {
+  Secret.SnowflakePrivateKey.Stub(TestKey());
+}
+
+[Test(Account)]
+void a_count_is_one_statement_signed_with_a_key_pair_jwt() {
+  Http.Post.Stub((url, body, headers) => {
+    Assert.Equal("https://myorg-myaccount.snowflakecomputing.com/api/v2/statements", url);
+    Assert.Equal("KEYPAIR_JWT", headers["X-Snowflake-Authorization-Token-Type"]);
+    // A JWT — header, claims, signature — made from the stubbed key.
+    Assert.StartsWith("Bearer ey", headers["Authorization"]);
+    Assert.Equal(3, headers["Authorization"].Split('.').Length);
+    Assert.Contains("COUNT(", body);
+    Assert.Contains("\"warehouse\":\"ANALYTICS_WH\"", body);
+    return new HttpResponse { StatusCode = 200, Body = Finished("COUNT(*)", "2") };
+  });
+
+  Assert.Equal(2, Order.Count());
+}
+
+[Test(Account)]
+void an_update_is_one_statement_and_answers_the_rows_snowflake_reports() {
+  Http.Post.Stub((url, body, headers) => {
+    Assert.Contains("UPDATE", body);
+    return new HttpResponse { StatusCode = 200, Body =
+      "{\"code\":\"090001\",\"statementHandle\":\"01b-update\",\"resultSetMetaData\":{\"numRows\":1,\"rowType\":[],"
+      + "\"partitionInfo\":[{\"rowCount\":1}]},\"data\":[[\"3\",\"0\"]],"
+      + "\"stats\":{\"numRowsInserted\":0,\"numRowsUpdated\":3,\"numRowsDeleted\":0,\"numDuplicateRowsUpdated\":0}}" };
+  });
+
+  Assert.Equal(3, Order.Where(o => o.Region == "North").Update(o => { o.Total = 0m; }));
+}

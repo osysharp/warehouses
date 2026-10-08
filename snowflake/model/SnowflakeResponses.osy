@@ -1,0 +1,49 @@
+namespace Osysharp.Warehouses.Snowflake;
+
+/// A response from Snowflake's SQL API: a finished statement's first partition of rows and what describes them, or —
+/// with status 202 — the handle of one still running.
+public class SnowflakeResult {
+  public string? Code;
+  public string? Message;
+  public string? SqlState;
+  public string? StatementHandle;
+  public string? StatementStatusUrl;
+  public SnowflakeResultMetaData? ResultSetMetaData;
+  public List<List<string?>> Data = [];
+  /// A DML statement's row counts — null for a query.
+  public SnowflakeStats? Stats;
+}
+
+/// How many rows a result has, the type of each column, and the partitions the rows are split into.
+public class SnowflakeResultMetaData {
+  public long NumRows;
+  public List<SnowflakeColumnType> RowType = [];
+  public List<SnowflakePartitionInfo> PartitionInfo = [];
+}
+
+/// One result column: its name and its Snowflake type (`fixed`, `real`, `text`, `boolean`, `date`, `time`,
+/// `timestamp_ntz`, `timestamp_ltz`, `timestamp_tz`, …).
+public class SnowflakeColumnType {
+  public string Name = "";
+  public string Type = "";
+  public bool Nullable;
+}
+
+/// One partition of a result. The first arrives with the statement; each later one is fetched by its index.
+public class SnowflakePartitionInfo {
+  public long RowCount;
+  public long UncompressedSize;
+}
+
+/// A later partition, when it arrives wrapped in an object rather than as a bare array of rows.
+public class SnowflakePartitionData {
+  public List<List<string?>> Data = [];
+}
+
+/// What a DML statement changed, as the SQL API reports it in `stats`.
+public class SnowflakeStats {
+  public long NumRowsInserted;
+  public long NumRowsUpdated;
+  public long NumRowsDeleted;
+  public long NumDuplicateRowsUpdated;
+}

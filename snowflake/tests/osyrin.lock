@@ -1,0 +1,61 @@
+{
+  "platform": {
+    "version": "0.9.0"
+  },
+  "entries": [
+    {
+      "name": "Osysharp.Http",
+      "kind": "package",
+      "version": "1.0.0",
+      "hash": "sha256:4c24068aeea5ef1a155459d4cc332c85d7ee3d96049f2404e54ac860d94beb0f",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Http"
+    },
+    {
+      "name": "Osysharp.Sources",
+      "kind": "package",
+      "version": "1.2.0",
+      "hash": "sha256:618155897265b910da73215e2eb256920f772dac1c8613f3a38f8ec288049ace",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Sources"
+    },
+    {
+      "name": "Osysharp.Warehouses.Snowflake",
+      "kind": "package",
+      "version": "0.2.1",
+      "hash": "sha256:d4dc3310b64a5e2598bc6d27a68ca00e0ff8616c2c0cde5f1355269a0fb54572",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/snowflake",
+      "constraint": "0"
+    },
+    {
+      "name": "Osysharp.Exports",
+      "kind": "package",
+      "version": "1.0.0",
+      "hash": "sha256:dfa881066aa0c97992e10c589e1172141c2f7ab39299022f488c6fbeea2fbfcd",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Exports"
+    },
+    {
+      "name": "Osysharp.Observability",
+      "kind": "package",
+      "version": "1.0.0",
+      "hash": "sha256:aba8df0c3a7c56cfa752ad731283a5559ba21e6b04909ce580778518fe2f7196",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Observability",
+      "constraint": "1"
+    }
+  ],
+  "bridges": {
+    "searched": [
+      "workspace",
+      "platform",
+      "github"
+    ]
+  }
+}

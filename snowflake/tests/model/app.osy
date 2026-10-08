@@ -1,0 +1,23 @@
+// How an app connects Snowflake: the user's private key it holds as a secret, the account registered as a data source,
+// and an entity whose rows live there.
+
+using Osysharp.Sources;
+using Osysharp.Warehouses.Snowflake;
+
+app.Secrets = [ new Secret("SnowflakePrivateKey") ];
+
+app.DataSources = [
+  new SnowflakeSource("Warehouse") {
+    Account = "myorg-myaccount", User = "osy_reader", PublicKeyFingerprint = "SHA256:dGVzdC1maW5nZXJwcmludA==",
+    Warehouse = "ANALYTICS_WH", Database = "SALES", Schema = "PUBLIC", Role = "REPORTING"
+  }
+];
+
+/// An order kept in the warehouse — read and changed by statements Snowflake runs.
+[DataSource(DataSource.Warehouse), ExternalName("PUBLIC.ORDERS")]
+entity Order {
+  [Key, ExternalName("ORDER_ID")] string Number;
+  [ExternalName("REGION")] string Region;
+  [ExternalName("TOTAL")] decimal Total;
+  security { allow read, update when IsAnonymous || IsAuthenticated; }
+}

@@ -1,0 +1,153 @@
+namespace Osysharp.Warehouses.Snowflake;
+
+using Osysharp.Http;
+
+/// What a Snowflake source and a Snowflake export share: the account, the user and where statements run, and the one way
+/// both talk to Snowflake's SQL API — a key-pair JWT on each request, a statement posted, its status checked until it
+/// has finished.
+///
+/// The private key is the app's `SnowflakePrivateKey` secret, as PEM. Snowflake shows the fingerprint that matches it
+/// as `RSA_PUBLIC_KEY_FP` in `DESC USER`.
+public abstract class SnowflakeConnection {
+  /// The account identifier as the account's host name spells it: `MYORG-MYACCOUNT` for
+  /// `https://myorg-myaccount.snowflakecomputing.com`. An account locator with its region, `XY12345.eu-west-1`, works too.
+  public string Account = "";
+  /// The user the app connects as. Give it a role that can do what the app asks of it — read what a source's entities
+  /// name, or write the table an export fills — and nothing else.
+  public string User = "";
+  /// The fingerprint of the user's public key, `SHA256:…`.
+  public string PublicKeyFingerprint = "";
+  /// The warehouse, database, schema and role each statement runs in. Left empty, the user's default applies.
+  public string Warehouse = "";
+  public string Database = "";
+  public string Schema = "";
+  public string Role = "";
+  /// Seconds a statement may run before Snowflake cancels it.
+  public int TimeoutSeconds = 120;
+
+  // Sends one statement and returns its result. While Snowflake reports the statement still running, its status is
+  // checked again after a pause that doubles from a quarter of a second to eight seconds. Snowflake cancels a statement
+  // that outlives `TimeoutSeconds` and answers with an error, so the checks end there; a minute's grace past it covers a
+  // status that is slow to catch up.
+  protected SnowflakeResult Run(SnowflakeStatement statement, Dictionary<string, string> headers) {
+    var r = Http.Post(Host() + "/api/v2/statements", Body(statement), "application/json", headers);
+    var pause = TimeSpan.FromMilliseconds(250);
+    var giveUpAt = DateTime.UtcNow.AddSeconds(TimeoutSeconds + 60);
+    while (r.StatusCode == 202) {
+      if (DateTime.UtcNow > giveUpAt) {
+        throw new ExternalServiceException("Snowflake still reported a statement running a minute after its "
+          + Convert.ToString(TimeoutSeconds) + "-second timeout. Raise TimeoutSeconds, or make the statement cheaper for the warehouse.");
+      }
+      Task.Delay(pause);
+      if (pause.TotalSeconds < 8) { pause = pause * 2; }
+      var pending = JsonSerializer.Deserialize<SnowflakeResult>(r.Body);
+      var status = pending.StatementStatusUrl ?? ("/api/v2/statements/" + (pending.StatementHandle ?? ""));
+      r = Http.Get(Host() + status, headers);
+    }
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("a statement", r)); }
+    return JsonSerializer.Deserialize<SnowflakeResult>(r.Body);
+  }
+
+  // A later partition of a result. Its body is the rows alone — an array of rows, or an object holding them.
+  protected List<List<string?>> Partition(SnowflakeResult result, int partition, Dictionary<string, string> headers) {
+    var r = Http.Get(Host() + "/api/v2/statements/" + (result.StatementHandle ?? "") + "?partition=" + Convert.ToString(partition), headers);
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("result partition " + Convert.ToString(partition), r)); }
+    if (r.Body.Trim().StartsWith("[")) { return JsonSerializer.Deserialize<List<List<string?>>>(r.Body); }
+    return JsonSerializer.Deserialize<SnowflakePartitionData>(r.Body).Data;
+  }
+
+  protected List<List<string?>> AllRows(SnowflakeResult result, Dictionary<string, string> headers) {
+    List<List<string?>> rows = [];
+    foreach (var values in result.Data) { rows.Add(values); }
+    var partitions = PartitionCount(result);
+    var partition = 1;
+    while (partition < partitions) {
+      foreach (var values in Partition(result, partition, headers)) { rows.Add(values); }
+      partition = partition + 1;
+    }
+    return rows;
+  }
+
+  protected int PartitionCount(SnowflakeResult result) {
+    var meta = result.ResultSetMetaData;
+    if (meta == null) { return 1; }
+    return meta.PartitionInfo.Count;
+  }
+
+  protected List<string> TypesOf(SnowflakeResult result) {
+    List<string> types = [];
+    var meta = result.ResultSetMetaData;
+    if (meta == null) { return types; }
+    foreach (var column in meta.RowType) { types.Add(column.Type); }
+    return types;
+  }
+
+  string Body(SnowflakeStatement statement) {
+    // `Bindings` is null until there is something to bind, so a statement that binds nothing sends no `bindings` at all.
+    var request = new SnowflakeStatementRequest {
+      Statement = statement.Sql, Timeout = TimeoutSeconds,
+      Warehouse = Setting(Warehouse), Database = Setting(Database), Schema = Setting(Schema), Role = Setting(Role),
+      Bindings = null
+    };
+    if (statement.Bindings.Count > 0) {
+      var bound = new Dictionary<string, SnowflakeBinding>();
+      var position = 1;
+      foreach (var binding in statement.Bindings) {
+        bound.Add(Convert.ToString(position), binding);
+        position = position + 1;
+      }
+      request.Bindings = bound;
+    }
+    return JsonSerializer.Serialize(request,
+      new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+  }
+
+  // A setting left empty is not sent, so the user's default applies.
+  string? Setting(string value) {
+    return value == "" ? null : value;
+  }
+
+  protected Dictionary<string, string> Headers() {
+    if (Account == "" || User == "" || PublicKeyFingerprint == "") {
+      throw new ExternalServiceException("Snowflake needs an Account, a User and a PublicKeyFingerprint — set them where the source or export is declared.");
+    }
+    var headers = new Dictionary<string, string>();
+    headers.Add("Authorization", "Bearer " + Token());
+    headers.Add("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
+    headers.Add("Accept", "application/json");
+    return headers;
+  }
+
+  // A key-pair JWT, valid for 59 minutes. Snowflake names the account without any region and in upper case.
+  string Token() {
+    var account = Account.ToUpper();
+    var dot = account.IndexOf(".");
+    if (dot >= 0) { account = account.Substring(0, dot); }
+    var subject = account + "." + User.ToUpper();
+    var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    var header = Base64Url(Text.ToBytes(JsonSerializer.Serialize(new SnowflakeJwtHeader())));
+    var claims = new SnowflakeJwtClaims {
+      Issuer = subject + "." + PublicKeyFingerprint, Subject = subject, IssuedAt = now, ExpiresAt = now + 3540
+    };
+    var payload = Base64Url(Text.ToBytes(JsonSerializer.Serialize(claims)));
+    var signature = Base64Url(Crypto.SignRs256(Secret.SnowflakePrivateKey, Text.ToBytes(header + "." + payload)));
+    return header + "." + payload + "." + signature;
+  }
+
+  string Base64Url(byte[] bytes) {
+    return Convert.ToBase64String(bytes).Replace("+", "-").Replace("/", "_").TrimEnd('=');
+  }
+
+  string Host() {
+    return "https://" + Account.ToLower() + ".snowflakecomputing.com";
+  }
+
+  string Failure(string what, HttpResponse r) {
+    var body = r.Body.Length > 500 ? r.Body.Substring(0, 500) + "…" : r.Body;
+    return "Snowflake answered " + Convert.ToString(r.StatusCode) + " to " + what + " from account '" + Account + "': " + body;
+  }
+
+  protected string Quote(string identifier) {
+    return "\"" + identifier.Replace("\"", "\"\"") + "\"";
+  }
+}

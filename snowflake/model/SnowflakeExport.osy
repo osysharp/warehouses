@@ -1,0 +1,164 @@
+namespace Osysharp.Warehouses.Snowflake;
+
+using Osysharp.Exports;
+
+/// An export into a Snowflake table, written through Snowflake's SQL API with key-pair authentication. Declare it with
+/// what leaves:
+///
+///   app.Exports = [
+///     new SnowflakeExport("OrdersToWarehouse") {
+///       Account = "MYORG-MYACCOUNT", User = "OSY_LOADER", PublicKeyFingerprint = "SHA256:…",
+///       Warehouse = "LOAD_WH", Database = "SALES", Schema = "PUBLIC", Role = "LOADER",
+///       Table = "ORDERS_EXPORT",
+///       Rows = Order.Select(o => new { o.Number, o.Total, o.PlacedAt }),
+///     },
+///   ];
+///
+/// The table holds one row per exported row: `Id`, the exported columns, `_SEQUENCE` — the change that last wrote the
+/// row — and `_DELETED`. It is created when the export first delivers, and a column added to the export is added to it.
+///
+/// Each batch is one `MERGE` that writes a row only when its change is newer than the one the table holds, so a batch
+/// delivered twice changes nothing the second time. A delete sets `_DELETED` rather than removing the row, so a batch
+/// delivered again cannot bring back a row deleted after it; read the table through a view that leaves those rows out.
+public class SnowflakeExport : SnowflakeConnection, IExportSink {
+  /// The table the export writes: `ORDERS_EXPORT` in `Schema`, or `OTHER_SCHEMA.ORDERS_EXPORT`.
+  public string Table = "";
+
+  public void EnsureSchema(ExportSchema schema) {
+    var headers = Headers();
+    List<string> definitions = [];
+    foreach (var column in schema.Columns) { definitions.Add(Quote(column.Name) + " " + ColumnType(column.Type)); }
+    definitions.Add(Quote("_SEQUENCE") + " NUMBER(38,0) NOT NULL");
+    definitions.Add(Quote("_DELETED") + " BOOLEAN NOT NULL");
+    Run(new SnowflakeStatement { Sql = "CREATE TABLE IF NOT EXISTS " + Target() + " (" + string.Join(", ", definitions) + ")" }, headers);
+    // A table made for an earlier version of the export gains the columns added since; one it already has is left alone.
+    foreach (var column in schema.Columns) {
+      Run(new SnowflakeStatement {
+        Sql = "ALTER TABLE " + Target() + " ADD COLUMN IF NOT EXISTS " + Quote(column.Name) + " " + ColumnType(column.Type)
+      }, headers);
+    }
+  }
+
+  public void WriteBatch(ExportBatch batch) {
+    var changes = Latest(batch.Changes);
+    if (changes.Count == 0) { return; }
+    var columns = batch.Schema.Columns;
+
+    // Every value is bound as text and converted in the select list, so a decimal or an instant arrives exactly as the
+    // platform wrote it. A delete binds its key and nothing else.
+    List<SnowflakeBinding> bound = [];
+    List<string> rows = [];
+    foreach (var change in changes) {
+      var deleted = change.Op == "Delete";
+      List<string> markers = [];
+      var index = 0;
+      foreach (var column in columns) {
+        string? value = null;
+        if (index == 0) {
+          value = change.Key[0];
+        } else if (!deleted) {
+          value = change.Values[index];
+        }
+        bound.Add(new SnowflakeBinding { Value = value });
+        markers.Add("?");
+        index = index + 1;
+      }
+      bound.Add(new SnowflakeBinding { Value = Convert.ToString(change.Sequence) });
+      bound.Add(new SnowflakeBinding { Value = deleted ? "true" : "false" });
+      markers.Add("?");
+      markers.Add("?");
+      rows.Add("(" + string.Join(", ", markers) + ")");
+    }
+
+    List<string> selected = [];
+    List<string> names = [];
+    List<string> sets = [];
+    List<string> inserted = [];
+    var position = 1;
+    foreach (var column in columns) {
+      var name = Quote(column.Name);
+      selected.Add(Typed(column.Type, "$" + Convert.ToString(position)) + " AS " + name);
+      names.Add(name);
+      if (position > 1) { sets.Add(name + " = s." + name); }
+      inserted.Add("s." + name);
+      position = position + 1;
+    }
+    var sequence = Quote("_SEQUENCE");
+    var deletedColumn = Quote("_DELETED");
+    selected.Add("TO_NUMBER($" + Convert.ToString(position) + ", 38, 0) AS " + sequence);
+    selected.Add("TO_BOOLEAN($" + Convert.ToString(position + 1) + ") AS " + deletedColumn);
+    names.Add(sequence);
+    names.Add(deletedColumn);
+    sets.Add(sequence + " = s." + sequence);
+    sets.Add(deletedColumn + " = s." + deletedColumn);
+    inserted.Add("s." + sequence);
+    inserted.Add("s." + deletedColumn);
+    var key = Quote(columns[0].Name);
+
+    var sql = "MERGE INTO " + Target() + " AS t USING (SELECT " + string.Join(", ", selected)
+      + " FROM VALUES " + string.Join(", ", rows) + ") AS s ON t." + key + " = s." + key
+      + " WHEN MATCHED AND s." + sequence + " > t." + sequence + " THEN UPDATE SET " + string.Join(", ", sets)
+      + " WHEN NOT MATCHED THEN INSERT (" + string.Join(", ", names) + ") VALUES (" + string.Join(", ", inserted) + ")";
+    Run(new SnowflakeStatement { Sql = sql, Bindings = bound }, Headers());
+  }
+
+  // The newest change of each row in the batch, in the order the rows first appear. A MERGE whose source holds one row
+  // twice is refused as nondeterministic, and only the newest change of a row decides what the table holds.
+  List<ExportChange> Latest(List<ExportChange> changes) {
+    var newest = new Dictionary<string, ExportChange>();
+    List<string> order = [];
+    foreach (var change in changes) {
+      var key = change.Key[0] ?? "";
+      if (!newest.ContainsKey(key)) {
+        order.Add(key);
+        newest.Add(key, change);
+      } else if (change.Sequence > newest[key].Sequence) {
+        newest[key] = change;
+      }
+    }
+    List<ExportChange> latest = [];
+    foreach (var key in order) { latest.Add(newest[key]); }
+    return latest;
+  }
+
+  // The table as Snowflake names it: each part quoted, so its case is kept.
+  string Target() {
+    if (Table == "") {
+      throw new ExternalServiceException("SnowflakeExport needs a Table — set it where the export is declared.");
+    }
+    List<string> parts = [];
+    foreach (var part in Table.Split('.')) { parts.Add(Quote(part)); }
+    return string.Join(".", parts);
+  }
+
+  // The Snowflake column type a plan type is kept in. A decimal keeps 18 places after the point; a bigdecimal, whose
+  // digits can outnumber any NUMBER's, is kept as its text.
+  string ColumnType(string type) {
+    if (type == "string" || type == "Guid" || type == "bigdecimal") { return "TEXT"; }
+    if (type == "bool") { return "BOOLEAN"; }
+    if (type == "int" || type == "long") { return "NUMBER(38,0)"; }
+    if (type == "decimal") { return "NUMBER(38,18)"; }
+    if (type == "double") { return "FLOAT"; }
+    if (type == "DateTime") { return "TIMESTAMP_NTZ"; }
+    if (type == "DateOnly") { return "DATE"; }
+    if (type == "TimeOnly") { return "TIME"; }
+    if (type == "DateTimeOffset") { return "TIMESTAMP_TZ"; }
+    if (type == "Geography") { return "GEOGRAPHY"; }
+    throw new ValidationException("SnowflakeExport cannot keep a column of type '" + type + "'.");
+  }
+
+  // The bound text at `reference`, converted to the column's type.
+  string Typed(string type, string reference) {
+    if (type == "string" || type == "Guid" || type == "bigdecimal") { return reference; }
+    if (type == "bool") { return "TO_BOOLEAN(" + reference + ")"; }
+    if (type == "int" || type == "long") { return "TO_NUMBER(" + reference + ", 38, 0)"; }
+    if (type == "decimal") { return "TO_NUMBER(" + reference + ", 38, 18)"; }
+    if (type == "double") { return "TO_DOUBLE(" + reference + ")"; }
+    if (type == "DateTime") { return "TO_TIMESTAMP_NTZ(" + reference + ")"; }
+    if (type == "DateOnly") { return "TO_DATE(" + reference + ")"; }
+    if (type == "TimeOnly") { return "TO_TIME(" + reference + ")"; }
+    if (type == "DateTimeOffset") { return "TO_TIMESTAMP_TZ(" + reference + ")"; }
+    if (type == "Geography") { return "TO_GEOGRAPHY(" + reference + ")"; }
+    throw new ValidationException("SnowflakeExport cannot keep a column of type '" + type + "'.");
+  }
+}

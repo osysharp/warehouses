@@ -1,0 +1,144 @@
+namespace Osysharp.Warehouses.Snowflake;
+
+using Osysharp.Http;
+using Osysharp.Sources;
+
+/// A data source over a Snowflake account, read through Snowflake's SQL API with key-pair authentication. Register it
+/// under a name, and point entities at it:
+///
+///   app.DataSources = [
+///     new SnowflakeSource("Warehouse") {
+///       Account = "MYORG-MYACCOUNT", User = "OSY_READER", PublicKeyFingerprint = "SHA256:…",
+///       Warehouse = "ANALYTICS_WH", Database = "SALES", Schema = "PUBLIC", Role = "REPORTING",
+///     },
+///   ];
+///
+///   [DataSource(DataSource.Warehouse), ExternalName("PUBLIC.ORDERS")]
+///   entity Order { [Key, ExternalName("ORDER_ID")] string Number; [ExternalName("TOTAL")] decimal Total; }
+///
+/// The account, the user and the key are the settings every Snowflake class shares — see `SnowflakeConnection`.
+///
+///
+/// Every query an app writes over those entities becomes one statement — filter, read rule, grouping, order and paging
+/// included — so Snowflake returns only the rows the caller may read.
+public class SnowflakeSource : SnowflakeConnection, IWritableEntitySource {
+  public const QueryFeatures Pushdown = QueryFeatures.All | QueryFeatures.Joins | QueryFeatures.Distinct | QueryFeatures.Having
+    | QueryFeatures.Computed | QueryFeatures.Writes | QueryFeatures.Subqueries | QueryFeatures.SetOperations
+    | QueryFeatures.Windows | QueryFeatures.ValueJoins | QueryFeatures.Inserts
+    | QueryFeatures.PagedWrites | QueryFeatures.Percentiles;
+  /// The functions this package translates (extension_model_design §12.5). `Text.Trim`, `TrimStart` and `TrimEnd` are among them — given every
+  /// character .NET calls whitespace. `Text.Upper` and `Text.Lower` apply the case map the plan
+  /// carries — .NET's, where Snowflake's own UPPER is the full mapping (`ß` → `SS`) — and `Text.Length` counts UTF-16 units.
+  public const string Functions = "Date.Year,Date.Month,Date.Day,Date.Hour,Date.Minute,Date.Second,Math.Round,Math.Floor,Math.Ceiling,Math.Abs,Text.Trim,Math.Truncate,Math.Sign,Math.Min,Math.Max,Math.Pow,Math.Sqrt,Math.Clamp,Text.TrimStart,Text.TrimEnd,Text.Replace,Text.IsEmpty,Text.IsBlank,Text.Like,Text.Upper,Text.Lower,Text.Length,Date.AddDays,Date.AddHours,Date.AddMinutes,Date.AddSeconds,Date.AddMilliseconds,Date.AddMonths,Date.AddYears,Date.Date,Date.DayOfWeek,Date.DayOfYear,Date.DayNumber,Convert.ToInt,Convert.ToInt64,Convert.ToDecimal,Convert.ToDouble,Convert.ToBool,Convert.ToString,Cast.ToInt,Cast.ToLong,Cast.ToDecimal,Cast.ToDouble";
+  public const string SecurityKitVersion = "1";
+
+  public stream<SourceRow> Query(QueryPlan plan) {
+    var headers = Headers();
+    var result = Run(new SnowflakeSql().Translate(plan), headers);
+    var types = TypesOf(result);
+    foreach (var values in result.Data) { yield return Row(values, types); }
+    var partitions = PartitionCount(result);
+    var partition = 1;
+    while (partition < partitions) {
+      foreach (var values in Partition(result, partition, headers)) { yield return Row(values, types); }
+      partition = partition + 1;
+    }
+  }
+
+  /// Plan 1.5: one UPDATE or DELETE — the rule and the caller's condition inside it, as a read carries them — answering how many
+  /// rows Snowflake reports it changed. Plan 1.7: one INSERT … SELECT, answering how many rows it reports inserted.
+  public int Execute(QueryPlan plan) {
+    var result = Run(new SnowflakeSql().Translate(plan), Headers());
+    if (result.Stats == null) {
+      throw new ExternalServiceException("Snowflake answered a " + plan.Op + " with no row counts, so how many rows it changed is unknown.");
+    }
+    var changed = plan.Op == "Delete" ? result.Stats.NumRowsDeleted : plan.Op == "Insert" ? result.Stats.NumRowsInserted : result.Stats.NumRowsUpdated;
+    return Convert.ToInt32(changed);
+  }
+
+  /// Every table and view in `Database` — in `Schema` alone when one is set — with the columns whose Snowflake type a
+  /// plan can carry and each table's primary key. A column of another type (`VARIANT`, `BINARY`, …) is left out.
+  public SourceSchema DescribeSchema() {
+    if (Database == "") {
+      throw new ExternalServiceException("SnowflakeSource needs a Database to describe — set it where the source is registered.");
+    }
+    var headers = Headers();
+
+    var columnsSql = "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, NUMERIC_SCALE, IS_NULLABLE FROM "
+                   + Quote(Database) + ".INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA <> 'INFORMATION_SCHEMA'";
+    List<SnowflakeBinding> bindings = [];
+    if (Schema != "") {
+      columnsSql = columnsSql + " AND TABLE_SCHEMA = ?";
+      bindings.Add(new SnowflakeBinding { Type = "TEXT", Value = Schema });
+    }
+    columnsSql = columnsSql + " ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION";
+    var columns = Run(new SnowflakeStatement { Sql = columnsSql, Bindings = bindings }, headers);
+
+    var keysSql = Schema == ""
+      ? "SHOW PRIMARY KEYS IN DATABASE " + Quote(Database)
+      : "SHOW PRIMARY KEYS IN SCHEMA " + Quote(Database) + "." + Quote(Schema);
+    var keyResult = Run(new SnowflakeStatement { Sql = keysSql }, headers);
+    var keyTypes = TypesOf(keyResult);
+    List<string> keys = [];
+    foreach (var row in AllRows(keyResult, headers)) {
+      keys.Add(Cell(row, keyResult, "schema_name") + "." + Cell(row, keyResult, "table_name") + "." + Cell(row, keyResult, "column_name"));
+    }
+
+    List<SourceTable> tables = [];
+    var current = new SourceTable();
+    foreach (var row in AllRows(columns, headers)) {
+      var table = (row[0] ?? "") + "." + (row[1] ?? "");
+      var type = PlanType(row[3] ?? "", row[4]);
+      if (type == null) { continue; }
+      if (table != current.Name) {
+        current = new SourceTable { Name = table };
+        tables.Add(current);
+      }
+      var column = row[2] ?? "";
+      current.Columns.Add(new SourceColumn {
+        Name = column, Type = type, Nullable = row[5] == "YES", Key = keys.Contains(table + "." + column),
+      });
+    }
+    return new SourceSchema { Tables = tables };
+  }
+
+
+  SourceRow Row(List<string?> values, List<string> types) {
+    var decode = new SnowflakeValues();
+    List<string?> canonical = [];
+    var index = 0;
+    foreach (var value in values) {
+      canonical.Add(decode.Canonical(value, index < types.Count ? types[index] : "text"));
+      index = index + 1;
+    }
+    return new SourceRow { Values = canonical };
+  }
+
+  // The value in a named column of a result row, matched without regard to case.
+  string Cell(List<string?> row, SnowflakeResult result, string name) {
+    var meta = result.ResultSetMetaData;
+    if (meta == null) { return ""; }
+    var index = 0;
+    foreach (var column in meta.RowType) {
+      if (column.Name.ToLower() == name) { return row[index] ?? ""; }
+      index = index + 1;
+    }
+    return "";
+  }
+
+  // The plan type a Snowflake column's values arrive as, or null for a type a plan cannot carry. A NUMBER with no
+  // scale is a `long`: Snowflake's INTEGER is NUMBER(38,0), and a value past a long's range fails when it is read.
+  string? PlanType(string dataType, string? scale) {
+    var t = dataType.ToUpper();
+    if (t == "NUMBER") { return scale == null || scale == "0" ? "long" : "decimal"; }
+    if (t == "FLOAT") { return "double"; }
+    if (t == "TEXT") { return "string"; }
+    if (t == "BOOLEAN") { return "bool"; }
+    if (t == "DATE") { return "DateOnly"; }
+    if (t == "TIME") { return "TimeOnly"; }
+    if (t == "TIMESTAMP_NTZ") { return "DateTime"; }
+    if (t == "TIMESTAMP_LTZ" || t == "TIMESTAMP_TZ") { return "DateTimeOffset"; }
+    if (t == "GEOGRAPHY") { return "Geography"; }
+    return null;
+  }
+}

@@ -1,0 +1,13 @@
+// The producer's test project for Osysharp.Warehouses.Snowflake. Snowflake's SQL API is STUBBED — `Http.Post.Stub` answers
+// each statement as Snowflake does — and the private key is a test's own (`Secret.SnowflakePrivateKey.Stub`), so every test
+// shows the whole conversation an app has with Snowflake, key-pair JWT included, and none reaches a real account.
+app SnowflakeKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Http;
+  use Osysharp.Sources;
+  use Osysharp.Warehouses.Snowflake@0 {
+    egress "*.snowflakecomputing.com";
+    secret "SnowflakePrivateKey";
+  }
+}
