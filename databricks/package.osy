@@ -1,0 +1,21 @@
+// Osysharp.Warehouses.Databricks — Databricks for an Osy# app, both ways: entities whose rows live in a Databricks SQL warehouse,
+// read through the SQL Statement Execution API and secured by the app's own rules; and an app's own entities exported
+// into Databricks tables as they change.
+//
+// It asks for the Databricks hosts and one secret, and an app that uses it grants them or does not compile.
+package Osysharp.Warehouses.Databricks {
+  version     "0.2.1";
+  minPlatform "0.9.0";
+  summary     "Databricks as a data source and an export destination: entities read from a SQL warehouse, and changes merged into its tables.";
+
+  model "model/*.osy";
+  use Osysharp.Http;
+  use Osysharp.Sources;
+  use Osysharp.Exports;
+
+  egress "*.cloud.databricks.com";
+  egress "*.azuredatabricks.net";
+  egress "*.gcp.databricks.com";
+  secret "DatabricksToken";
+  tests "tests";
+}

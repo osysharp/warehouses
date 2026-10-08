@@ -1,0 +1,45 @@
+namespace Osysharp.Warehouses.Databricks;
+
+/// A response from the SQL Statement Execution API: the statement's id and where it is, and — once it has succeeded —
+/// what its columns are and its first chunk of rows.
+public class DatabricksStatementResponse {
+  [ExternalName("statement_id")] public string? StatementId;
+  public DatabricksStatus? Status;
+  public DatabricksManifest? Manifest;
+  public DatabricksResultChunk? Result;
+}
+
+/// Where a statement is — `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELED` or `CLOSED` — and why, when it failed.
+public class DatabricksStatus {
+  public string State = "";
+  public DatabricksError? Error;
+}
+
+public class DatabricksError {
+  [ExternalName("error_code")] public string? ErrorCode;
+  public string? Message;
+}
+
+/// The shape of a succeeded statement's result.
+public class DatabricksManifest {
+  [ExternalName("total_chunk_count")] public int TotalChunkCount;
+  public DatabricksSchema? Schema;
+}
+
+public class DatabricksSchema {
+  public List<DatabricksColumn> Columns = [];
+}
+
+/// One result column: its name, its Databricks type name (`STRING`, `DECIMAL`, `TIMESTAMP`, …) and its position.
+public class DatabricksColumn {
+  public string Name = "";
+  [ExternalName("type_name")] public string TypeName = "";
+  public int Position;
+}
+
+/// One chunk of rows. Every value is a string, or null. The next chunk, when there is one, is at `NextChunkInternalLink`.
+public class DatabricksResultChunk {
+  [ExternalName("chunk_index")] public int ChunkIndex;
+  [ExternalName("data_array")] public List<List<string?>> DataArray = [];
+  [ExternalName("next_chunk_internal_link")] public string? NextChunkInternalLink;
+}

@@ -1,0 +1,126 @@
+namespace Osysharp.Warehouses.Databricks;
+
+using Osysharp.Http;
+
+/// What a Databricks source and a Databricks export share: the workspace, the SQL warehouse and where names resolve, and
+/// the one way both talk to the SQL Statement Execution API — a bearer token on each request, a statement posted, its
+/// status checked until it has finished.
+///
+/// The app authenticates with its `DatabricksToken` secret — a personal access token, or an OAuth token for a service
+/// principal.
+public abstract class DatabricksConnection {
+  /// The workspace host, as its URL spells it: `adb-1234567890123456.7.azuredatabricks.net`,
+  /// `dbc-a1b2c3d4-e5f6.cloud.databricks.com` or `1234567890123456.7.gcp.databricks.com`.
+  public string Host = "";
+  /// The SQL warehouse each statement runs on.
+  public string WarehouseId = "";
+  /// The catalog and schema a statement's unqualified names resolve in. Left empty, the warehouse's defaults apply.
+  public string Catalog = "";
+  public string Schema = "";
+  /// Seconds the first request waits for a statement to finish before it answers that it is still running, 5 to 50.
+  public int WaitSeconds = 30;
+  /// Seconds a statement may keep the warehouse busy before it is cancelled and the call fails.
+  public int TimeoutSeconds = 600;
+
+  // Sends one statement and returns its response once it has finished. The first request waits up to `WaitSeconds`;
+  // after that the status is checked again after a pause that doubles from a quarter of a second to eight seconds. A
+  // statement still running after `TimeoutSeconds` is cancelled, so it stops using the warehouse, and the call fails.
+  protected DatabricksStatementResponse Run(string sql, List<DatabricksParameter> parameters, Dictionary<string, string> headers) {
+    var r = Http.Post(Url("/api/2.0/sql/statements"), Body(sql, parameters), "application/json", headers);
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("a statement", r)); }
+    var response = JsonSerializer.Deserialize<DatabricksStatementResponse>(r.Body);
+    var pause = TimeSpan.FromMilliseconds(250);
+    var giveUpAt = DateTime.UtcNow.AddSeconds(TimeoutSeconds);
+    while (StateOf(response) == "PENDING" || StateOf(response) == "RUNNING") {
+      var id = response.StatementId ?? "";
+      if (DateTime.UtcNow > giveUpAt) {
+        Http.Post(Url("/api/2.0/sql/statements/" + id + "/cancel"), "", "application/json", headers);
+        throw new ExternalServiceException("the Databricks warehouse was still running a statement after "
+          + Convert.ToString(TimeoutSeconds) + " seconds, so it was cancelled. Make the statement cheaper for the warehouse, "
+          + "give it more capacity, or raise TimeoutSeconds.");
+      }
+      Task.Delay(pause);
+      if (pause.TotalSeconds < 8) { pause = pause * 2; }
+      var status = Http.Get(Url("/api/2.0/sql/statements/" + id), headers);
+      if (!status.IsSuccess) { throw new ExternalServiceException(Failure("a status check", status)); }
+      response = JsonSerializer.Deserialize<DatabricksStatementResponse>(status.Body);
+    }
+    var state = StateOf(response);
+    if (state != "SUCCEEDED") {
+      var reason = "";
+      var current = response.Status;
+      if (current != null) {
+        var error = current.Error;
+        if (error != null) { reason = ": " + (error.Message ?? error.ErrorCode ?? ""); }
+      }
+      throw new ExternalServiceException("a Databricks statement ended " + state + reason);
+    }
+    return response;
+  }
+
+  protected DatabricksResultChunk Chunk(string link, Dictionary<string, string> headers) {
+    var r = Http.Get(Url(link), headers);
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("a result chunk", r)); }
+    return JsonSerializer.Deserialize<DatabricksResultChunk>(r.Body);
+  }
+
+  protected List<List<string?>> AllRows(DatabricksStatementResponse response, Dictionary<string, string> headers) {
+    List<List<string?>> rows = [];
+    var chunk = response.Result;
+    while (chunk != null) {
+      foreach (var values in chunk.DataArray) { rows.Add(values); }
+      var next = chunk.NextChunkInternalLink;
+      if (next == null) {
+        chunk = null;
+      } else {
+        chunk = Chunk(next, headers);
+      }
+    }
+    return rows;
+  }
+
+  string StateOf(DatabricksStatementResponse response) {
+    var status = response.Status;
+    if (status == null) { return ""; }
+    return status.State;
+  }
+
+  string Body(string sql, List<DatabricksParameter> parameters) {
+    // `Parameters` is null until there is something to bind, so a statement that binds nothing sends no `parameters`.
+    var request = new DatabricksStatementRequest {
+      Statement = sql, WarehouseId = WarehouseId, WaitTimeout = Convert.ToString(WaitSeconds) + "s",
+      Catalog = Setting(Catalog), Schema = Setting(Schema), Parameters = null
+    };
+    if (parameters.Count > 0) { request.Parameters = parameters; }
+    return JsonSerializer.Serialize(request,
+      new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+  }
+
+  // A setting left empty is not sent, so the warehouse's default applies.
+  string? Setting(string value) {
+    return value == "" ? null : value;
+  }
+
+  protected Dictionary<string, string> Headers() {
+    if (Host == "" || WarehouseId == "") {
+      throw new ExternalServiceException("Databricks needs a Host and a WarehouseId — set them where the source or export is declared.");
+    }
+    var headers = new Dictionary<string, string>();
+    headers.Add("Authorization", "Bearer " + Secret.DatabricksToken);
+    headers.Add("Accept", "application/json");
+    return headers;
+  }
+
+  string Url(string path) {
+    return "https://" + Host.Replace("https://", "").TrimEnd('/') + path;
+  }
+
+  string Failure(string what, HttpResponse r) {
+    var body = r.Body.Length > 500 ? r.Body.Substring(0, 500) + "…" : r.Body;
+    return "Databricks answered " + Convert.ToString(r.StatusCode) + " to " + what + " on '" + Host + "': " + body;
+  }
+
+  protected string Quote(string identifier) {
+    return "`" + identifier.Replace("`", "``") + "`";
+  }
+}

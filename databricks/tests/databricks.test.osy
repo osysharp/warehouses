@@ -1,0 +1,51 @@
+// Osysharp.Warehouses.Databricks — what an app's query becomes on the wire: one statement posted to the warehouse with the
+// app's token as a bearer token, and the warehouse's answer read back as the value the query asked for.
+
+using Osysharp.Http;
+
+/// The warehouse's answer to a statement that has finished: one column, one row.
+string Finished(string column, string type, string value) {
+  return "{\"statement_id\":\"s-1\",\"status\":{\"state\":\"SUCCEEDED\"},"
+    + "\"manifest\":{\"format\":\"JSON_ARRAY\",\"total_chunk_count\":1,\"schema\":{\"column_count\":1,"
+    + "\"columns\":[{\"name\":\"" + column + "\",\"type_name\":\"" + type + "\",\"position\":0}]}},"
+    + "\"result\":{\"chunk_index\":0,\"row_offset\":0,\"data_array\":[[\"" + value + "\"]]}}";
+}
+
+[TestFixture]
+void Workspace() {
+  // The token this test app's workspace accepts. In a real app it is set once with `osy secret set DatabricksToken`.
+  Secret.DatabricksToken.Stub("dapi-test-token");
+}
+
+[Test(Workspace)]
+void a_count_is_one_statement_sent_with_the_apps_token() {
+  Http.Post.Stub((url, body, headers) => {
+    Assert.Equal("https://adb-1234567890123456.7.azuredatabricks.net/api/2.0/sql/statements", url);
+    Assert.Equal("Bearer dapi-test-token", headers["Authorization"]);
+    Assert.Contains("COUNT(", body);
+    Assert.Contains("\"warehouse_id\":\"wh-1\"", body);
+    return new HttpResponse { StatusCode = 200, Body = Finished("count(1)", "LONG", "2") };
+  });
+
+  Assert.Equal(2, Order.Count());
+}
+
+[Test(Workspace)]
+void an_update_is_one_statement_and_answers_the_rows_the_warehouse_changed() {
+  Http.Post.Stub((url, body, headers) => {
+    Assert.Contains("UPDATE", body);
+    Assert.Contains("North", body);
+    return new HttpResponse { StatusCode = 200, Body = Finished("num_affected_rows", "LONG", "3") };
+  });
+
+  Assert.Equal(3, Order.Where(o => o.Region == "North").Update(o => { o.Total = 0m; }));
+}
+
+[Test(Workspace)]
+void a_statement_the_warehouse_refuses_is_an_external_service_failure_naming_the_workspace() {
+  Http.Post.Stub((url, body) => new HttpResponse { StatusCode = 403, Body = "{\"error_code\":\"PERMISSION_DENIED\"}" });
+
+  var e = Assert.Throws<ExternalServiceException>(() => Order.Count());
+  Assert.Contains("Databricks answered 403", e.Message);
+  Assert.Contains("adb-1234567890123456.7.azuredatabricks.net", e.Message);
+}

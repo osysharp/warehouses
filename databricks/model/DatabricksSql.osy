@@ -1,0 +1,975 @@
+namespace Osysharp.Warehouses.Databricks;
+
+using Osysharp.Sources;
+
+/// One statement for the Databricks SQL Statement Execution API: the SQL, with a named marker (`:p0`, `:p1`, …) for
+/// each bound value, and those values.
+public class DatabricksStatement {
+  public string Sql = "";
+  public List<DatabricksParameter> Parameters = [];
+}
+
+/// One bound value. Every value is sent as a `STRING` in its canonical form and the SQL casts it, so a 38-digit decimal
+/// or an instant arrives exactly as the platform wrote it.
+public class DatabricksParameter {
+  [ExternalName("name")] public string Name = "";
+  [ExternalName("type")] public string Type = "STRING";
+  /// The value's canonical text. Null is left out of the request, which the API reads as SQL NULL.
+  [ExternalName("value")] public string? Value;
+}
+
+/// Translates a query plan into one Databricks SQL statement.
+///
+/// The plan's semantics decide the SQL, not the workspace's defaults:
+/// - strings compare, order, group and take their minimum and maximum ORDINALLY — every string column is written
+///   `column COLLATE UTF8_BINARY`, so a table or schema default collation cannot reorder them;
+/// - null sorts as C# sorts it — first ascending, last descending — stated on every key, so no setting can change it;
+/// - `StartsWith`, `EndsWith` and `Contains` match their text literally;
+/// - the security clause is ANDed into the same `WHERE` as the filter, so a limit pages over the rows the caller may see;
+/// - a join through a reference is a `LEFT JOIN` over only the target rows that target's own security admits, so a row
+///   whose target the caller may not read stays, and reads that target's columns as null;
+/// - a computed value means what it means in C#: whole numbers divide truncating toward zero, a remainder keeps the sign
+///   of the number divided, and arithmetic on null is null;
+/// - what C# throws on fails the statement (`raise_error`), whatever the session's ANSI setting;
+/// - every value is a bound parameter, never text spliced into the statement;
+/// - a `DateTimeOffset` column is selected as ISO 8601 text with its offset, so it names the same instant whatever time
+///   zone the warehouse uses; a `DateTime` column has no zone and is selected as its text.
+public class DatabricksSql {
+  // Whether a SECURITY condition is being written (the plan's or a join's) — it keeps SQL's three-valued logic, where the
+  // author's condition answers C#'s `==`/`!=` over a null (extension_model_design §12.11) — and how many NOTs the
+  // condition sits under.
+  bool rule = false;
+  int negations = 0;
+  // Plan 1.6: the aliases of the nested reads being written, innermost last; the plans they are inside; and how many the
+  // statement has named, so each has its own alias.
+  List<string> aliases = [];
+  // Plan 1.6: while a nested read's join restricts its target, the rule's columns are the target's own, named bare.
+  bool bare;
+  List<QueryPlan> outers = [];
+  int subqueries = 0;
+  // Plan 1.8: while a merge's clauses are written, the aliases of the row already there and the row that would have been
+  // inserted. Null everywhere else, so an `Incoming` column outside a merge is refused rather than rendered as nonsense.
+  string? merged = null;
+  string? incoming = null;
+  // Plan 1.8: an insert that MERGES keeps the create rule OUT of the rows it reads — the rule governs what this
+  // statement CREATES, and a colliding row is UPDATED rather than created. It rides the NOT MATCHED arm instead.
+  bool createRuleOnTheRows = true;
+
+  // Values bind by NAME, so one list holds them in whatever order the pieces are rendered — both operands of a set
+  // operation included, so no two values share a marker.
+  public DatabricksStatement Translate(QueryPlan plan) {
+    List<DatabricksParameter> bound = [];
+    var sql = Statement(plan, bound);
+    return new DatabricksStatement { Sql = sql, Parameters = bound };
+  }
+
+  string Statement(QueryPlan plan, List<DatabricksParameter> bound) {
+    // Plan 1.6 (§12.16): a set operation — each operand a statement of its own, parenthesized so its order and paging stay
+    // its own. `UNION`, `INTERSECT` and `EXCEPT` keep each row once, as C#'s do; `UNION ALL` is `Concat`.
+    var setOp = plan.SetOp;
+    if (setOp != null && setOp.Right != null) {
+      plan.SetOp = null;
+      var left = Statement(plan, bound);
+      plan.SetOp = setOp;
+      var right = Statement(setOp.Right, bound);
+      var combine = setOp.Op == "Union" ? "UNION" : setOp.Op == "Concat" ? "UNION ALL" : setOp.Op == "Intersect" ? "INTERSECT" : "EXCEPT";
+      return "(" + left + ") " + combine + " (" + right + ")";
+    }
+    var head = bound;
+    var body = bound;
+    var tail = bound;
+    // Decided BEFORE the clauses are written: one rendered twice would bind its values twice.
+    createRuleOnTheRows = !(plan.Op == "Insert" && plan.ConflictKey.Count > 0);
+    var table = From(plan, body);
+    var where = Where(plan, body);
+    var sql = "";
+
+    // Plan 1.5 (§12.15): one statement changing every row the rules and the condition admit. SQL's UPDATE reads every
+    // assigned value from the row as it was.
+    if (plan.Op == "Update") {
+      List<string> assignments = [];
+      foreach (var column in plan.Set.Keys) { assignments.Add(Quote(column) + " = (" + Expr(plan.Set[column], plan, head) + ")"); }
+      sql = "UPDATE " + table + " SET " + string.Join(", ", assignments) + Chosen(plan, table, where, tail);
+    } else if (plan.Op == "Delete") {
+      sql = "DELETE FROM " + table + Chosen(plan, table, where, tail);
+    } else if (plan.Op == "Insert") {
+      // Plan 1.7 (§12.17): one row of Into for every row the rules and the condition admit, each column given its value read
+      // from that row.
+      List<string> intoColumns = [];
+      List<string> values = [];
+      foreach (var column in plan.Set.Keys) {
+        intoColumns.Add(Quote(column));
+        values.Add(Expr(plan.Set[column], plan, head));
+      }
+      // Plan 1.8 (§12.18): a row whose key columns match one already in Into does not create a second — that row is
+      // merged into instead, under the target's UPDATE rule.
+      //
+      // ⚑ MERGE is Databricks' own upsert: Delta Lake has no ON CONFLICT, and a MERGE takes a composite key with no
+      //   unique constraint to declare — which a lakehouse table does not enforce anyway.
+      if (plan.ConflictKey.Count > 0) {
+        List<string> aliased = [];
+        var column = 0;
+        foreach (var name in plan.Set.Keys) {
+          aliased.Add(values[column] + " AS " + Quote(name));
+          column = column + 1;
+        }
+        // The rows to merge are the rows the read admits — the same statement the plain insert selects, named so the
+        // matched and not-matched arms can read its columns. Its values are already bound in `head`, its condition in
+        // `body`, and the page its order chooses binds here, ahead of the arms that follow it.
+        var rows = "(SELECT " + string.Join(", ", aliased) + " FROM " + table + Chosen(plan, table, where, tail) + ") AS " + Quote("s");
+        List<string> on = [];
+        foreach (var key in plan.ConflictKey) { on.Add(Quote("t") + "." + Quote(key) + " = " + Quote("s") + "." + Quote(key)); }
+        merged = "t";
+        incoming = "s";
+        // The target's UPDATE rule rides the MATCHED arm, so a colliding row it does not admit is left exactly as it
+        // was — not merged, and not created either, because it collided.
+        var matched = "";
+        var mergeSecurity = plan.MergeSecurity;
+        if (mergeSecurity != null) {
+          rule = true;
+          matched = " AND " + Expr(mergeSecurity, plan, tail);
+          rule = false;
+        }
+        List<string> assignments = [];
+        foreach (var name in plan.OnConflict.Keys) { assignments.Add(Quote(name) + " = " + Expr(plan.OnConflict[name], plan, tail)); }
+        merged = null;
+        incoming = null;
+        List<string> inserted = [];
+        foreach (var name in plan.Set.Keys) { inserted.Add(Quote("s") + "." + Quote(name)); }
+        // The create rule governs the rows this CREATES — the ones that matched nothing. It is composed over the
+        // INCOMING row (`RuleOverIncomingRow`), so every column in it is an Incoming one and there is no bare column
+        // here to address against the wrong side.
+        var notMatched = "";
+        var createRule = plan.WriteSecurity;
+        if (createRule != null) {
+          incoming = "s";
+          rule = true;
+          notMatched = " AND " + Expr(createRule, plan, tail);
+          rule = false;
+          incoming = null;
+        }
+        sql = "MERGE INTO " + Table(plan.Into ?? "") + " AS " + Quote("t") + " USING " + rows
+          + " ON " + string.Join(" AND ", on)
+          + " WHEN MATCHED" + matched + " THEN UPDATE SET " + string.Join(", ", assignments)
+          + " WHEN NOT MATCHED" + notMatched + " THEN INSERT (" + string.Join(", ", intoColumns) + ") VALUES (" + string.Join(", ", inserted) + ")";
+      } else {
+      // Plan 1.7: or from the page its order chooses, the create rule within it.
+      sql = "INSERT INTO " + Table(plan.Into ?? "") + " (" + string.Join(", ", intoColumns) + ") SELECT " + string.Join(", ", values)
+        + " FROM " + table + Chosen(plan, table, where, tail);
+      }
+    } else
+    // Plan 1.4: aggregates with no GroupBy are ONE row over every filtered row — this statement with no GROUP BY, which
+    // is one row even over no rows.
+    if (plan.GroupBy.Count > 0 || plan.Aggregates.Count > 0) {
+      List<string> select = [];
+      List<string> positions = [];
+      foreach (var key in plan.GroupBy) {
+        select.Add(Selected(key, Ordered(key, plan, head), plan, head) + " AS " + Quote(key));
+        positions.Add(Convert.ToString(positions.Count + 1));
+      }
+      foreach (var aggregate in plan.Aggregates) {
+        select.Add((aggregate.Function == "Percentile" ? Percentile(aggregate, plan, head)
+                                                        : AggregateSelected(aggregate.Function, aggregate.Column, plan, head))
+                   + " AS " + Quote(aggregate.Name));
+      }
+      // Grouped by POSITION: a computed key rendered a second time would bind its values again and no longer match.
+      var grouped = "SELECT " + string.Join(", ", select) + " FROM " + table + where
+          + (positions.Count > 0 ? " GROUP BY " + string.Join(", ", positions) : "") + Having(plan, tail);
+      // Ordered outside the groups, by the names they answer as, so an order never renders a key again.
+      sql = plan.OrderBy.Count > 0
+        ? "SELECT * FROM (" + grouped + ") AS " + Quote("groups") + OrderAndPage(plan, "groups", tail)
+        : grouped + OrderAndPage(plan, null, tail);
+    } else if (plan.Op == "Rows") {
+      List<string> columns = [];
+      if (plan.Distinct) {
+        // A timestamp is formatted OUTSIDE the distinct rows, so two values naming the same instant stay one row.
+        foreach (var column in plan.Columns) {
+          columns.Add(Selected(column, Quote("distinct") + "." + Quote(column), plan, head) + " AS " + Quote(column));
+        }
+        sql = "SELECT " + string.Join(", ", columns) + " FROM " + DistinctRows(plan, table, where, head) + OrderAndPage(plan, "distinct", tail);
+      } else {
+        foreach (var column in plan.Columns) {
+          columns.Add(Selected(column, Col(column, plan, head), plan, head) + " AS " + Quote(column));
+        }
+        sql = "SELECT " + string.Join(", ", columns) + " FROM " + table + where + OrderAndPage(plan, null, tail);
+      }
+    } else if (plan.Op == "Count" && plan.Distinct) {
+      sql = "SELECT COUNT(*) FROM " + DistinctRows(plan, table, where, head);
+    } else if (plan.Op == "Count") {
+      // Plan 1.7: or the rows a page chooses, counted before an insert of them.
+      sql = "SELECT COUNT(*) FROM " + table + Chosen(plan, table, where, tail);
+    } else if (plan.Op == "Exists") {
+      // One row is enough to answer, and a scalar comparison reads the same in every SQL engine.
+      sql = "SELECT COUNT(*) > 0 FROM (SELECT 1 FROM " + table + where + " LIMIT 1) AS " + Quote("found");
+    } else {
+      sql = "SELECT " + AggregateSelected(plan.Op, plan.AggregateColumn, plan, head) + " FROM " + table + where;
+    }
+    return sql;
+  }
+
+  // Plan 1.7: the rows a write changes. Every row its condition and rules admit — or, when its order and paging choose them,
+  // `WHERE key IN (SELECT key FROM … ORDER BY … LIMIT …)` with the write rule within them.
+  string Chosen(QueryPlan plan, string table, string where, List<DatabricksParameter> bound) {
+    var keyColumn = plan.KeyColumn;
+    if (keyColumn == null) { return where; }
+    var key = Col(keyColumn, plan, bound);
+    var chosen = " WHERE " + key + " IN (SELECT " + key + " FROM " + table + where + OrderAndPage(plan, null, bound) + ")";
+    var writeSecurity = plan.WriteSecurity;
+    if (writeSecurity == null || !createRuleOnTheRows) { return chosen; }
+    rule = true;
+    chosen = chosen + " AND " + Expr(writeSecurity, plan, bound);
+    rule = false;
+    return chosen;
+  }
+
+  // Plan 1.2: the condition on the groups, after grouping and before order and paging.
+  string Having(QueryPlan plan, List<DatabricksParameter> bound) {
+    var having = plan.Having;
+    if (having == null) { return ""; }
+    return " HAVING " + Expr(having, plan, bound);
+  }
+
+  string Where(QueryPlan plan, List<DatabricksParameter> bound) {
+    List<string> parts = [];
+    var security = plan.Security;
+    if (security != null) {
+      rule = true;
+      parts.Add(Expr(security, plan, bound));
+      rule = false;
+    }
+    // Plan 1.5: a write's own rule is a rule too — SQL's nulls, and only what it makes true is changed. Plan 1.7: a write whose rows
+    // its order and paging choose applies it within those rows instead.
+    var writeSecurity = plan.WriteSecurity;
+    if (writeSecurity != null && plan.KeyColumn == null && createRuleOnTheRows) {
+      rule = true;
+      parts.Add(Expr(writeSecurity, plan, bound));
+      rule = false;
+    }
+    var filter = plan.Filter;
+    if (filter != null) { parts.Add(Expr(filter, plan, bound)); }
+    if (parts.Count == 0) { return ""; }
+    return " WHERE " + string.Join(" AND ", parts);
+  }
+
+  // `over` names the derived table a distinct or grouped read orders outside of, whose columns are the names its rows
+  // answer as.
+  string OrderAndPage(QueryPlan plan, string? over, List<DatabricksParameter> bound) {
+    var sql = "";
+    if (plan.OrderBy.Count > 0) {
+      List<string> keys = [];
+      foreach (var order in plan.OrderBy) {
+        // A grouped query may order by an aggregate, which is named by the alias it answers as.
+        var key = IsAggregate(order.Column, plan) ? Quote(order.Column)
+          : over != null ? OrderedAs(Quote(over) + "." + Quote(order.Column), order.Column, plan)
+          : Ordered(order.Column, plan, bound);
+        // Null is the lowest value, as C# sorts it — which is also Databricks's default, stated so no setting changes it.
+        keys.Add(key + (order.Descending ? " DESC NULLS LAST" : " ASC NULLS FIRST"));
+      }
+      sql = " ORDER BY " + string.Join(", ", keys);
+    }
+    var limit = plan.Limit;
+    var offset = plan.Offset;
+    if (limit != null) { sql = sql + " LIMIT " + Convert.ToString(limit); }
+    if (offset != null) {
+      // An offset follows a limit; `LIMIT ALL` is the spelling of "no limit".
+      if (limit == null) { sql = sql + " LIMIT ALL"; }
+      sql = sql + " OFFSET " + Convert.ToString(offset);
+    }
+    return sql;
+  }
+
+  // An aggregate as a row carries it: a minimum or maximum of a timestamp column is formatted like the column itself.
+  string AggregateSelected(string function, string? column, QueryPlan plan, List<DatabricksParameter> bound) {
+    var expr = Aggregate(function, column, plan, bound);
+    if ((function == "Min" || function == "Max") && column != null) { return Selected(column, expr, plan, bound); }
+    return expr;
+  }
+
+  // Plan 1.9: the continuous percentile of a column at its fraction, to the contract's ten decimal places — Databricks
+  // answers PERCENTILE_CONT as a DOUBLE, so the cast is what makes it agree with every other provider. The fraction is a
+  // validated number and must be a constant of the group, so it is written as a literal.
+  string Percentile(PlanAggregate aggregate, QueryPlan plan, List<DatabricksParameter> bound) {
+    var fraction = (aggregate.Fraction ?? 0.5m).ToString();
+    return "CAST(PERCENTILE_CONT(" + fraction + ") WITHIN GROUP (ORDER BY CAST(" + Col(aggregate.Column ?? "", plan, bound)
+      + " AS DOUBLE)) AS DECIMAL(38, 10))";
+  }
+
+  string Aggregate(string function, string? column, QueryPlan plan, List<DatabricksParameter> bound) {
+    var name = column ?? "";
+    if (function == "Count") { return column == null ? "COUNT(*)" : "COUNT(" + Col(name, plan, bound) + ")"; }
+    if (function == "CountDistinct") { return "COUNT(DISTINCT " + Ordered(name, plan, bound) + ")"; }
+    if (function == "Sum") { return "SUM(" + Col(name, plan, bound) + ")"; }
+    if (function == "Average") { return "AVG(" + Col(name, plan, bound) + ")"; }
+    if (function == "Min") { return "MIN(" + Ordered(name, plan, bound) + ")"; }
+    if (function == "Max") { return "MAX(" + Ordered(name, plan, bound) + ")"; }
+    throw new ValidationException("query plan 1 has no aggregate '" + function + "'.");
+  }
+
+  // A column's value as a row carries it. A DateTimeOffset keeps its offset, so the text names one instant in any
+  // session time zone; a DateTime has no zone to lose.
+  string Selected(string column, string expr, QueryPlan plan, List<DatabricksParameter> bound) {
+    var type = TypeOf(column, plan);
+    if (type == "DateTimeOffset") {
+      return "date_format(" + expr + ", " + Bind("yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX", bound) + ")";
+    }
+    if (type == "DateTime") { return "CAST(" + expr + " AS STRING)"; }
+    return expr;
+  }
+
+  string Expr(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    if (e.Kind == "Column") { return Col(e.Name ?? "", plan, bound); }
+    // Plan 1.6: a column of the row the nested read is directly inside — the root, or the nested read around this one.
+    if (e.Kind == "Outer") { return Quote(aliases.Count >= 2 ? aliases[aliases.Count - 2] : "r") + "." + Quote(e.Name ?? ""); }
+    // Plan 1.8 (§12.18): a column of the row that WOULD have been inserted — the merge's source side, SQL's EXCLUDED.
+    if (e.Kind == "Incoming") {
+      if (incoming == null) { throw new ValidationException("an Incoming column is read only while a collision is merged."); }
+      return Quote(incoming) + "." + Quote(e.Name ?? "");
+    }
+    if (e.Kind == "Subquery") { return Nested(e, plan, bound); }
+    // Plan 1.6: a window value, computed over the rows the statement reads.
+    if (e.Kind == "Window") { return Window(e, plan, bound); }
+    if (e.Kind == "Aggregate") { return Aggregate(e.Function ?? "", e.Column, plan, bound); }
+    if (e.Kind == "Literal") { return Literal(e.Type ?? "null", e.Value, bound); }
+    if (e.Kind == "Compare") {
+      var op = e.Op ?? "=";
+      var negated = negations % 2 == 1;
+      // The author's condition answers C#'s `==`/`!=` over a null (§12.11). A plan carries no nullability, so every operand
+      // but a literal may be null.
+      if (!rule && op == "<>") { return "(" + Side(e.Args[0], plan, bound) + " IS DISTINCT FROM " + Side(e.Args[1], plan, bound) + ")"; }
+      if (!rule && op == "=" && negated) {
+        return "(" + Side(e.Args[0], plan, bound) + " IS NOT DISTINCT FROM " + Side(e.Args[1], plan, bound) + ")";
+      }
+      if (!rule && op == "=" && e.Args[0].Kind != "Literal" && e.Args[1].Kind != "Literal") {
+        var equal = Side(e.Args[0], plan, bound) + " = " + Side(e.Args[1], plan, bound);
+        var bothNull = Side(e.Args[0], plan, bound) + " IS NULL AND " + Side(e.Args[1], plan, bound) + " IS NULL";
+        return "(" + equal + " OR (" + bothNull + "))";
+      }
+      var left = Side(e.Args[0], plan, bound);
+      var right = Side(e.Args[1], plan, bound);
+      if (!rule && negated && op != "=") { return "COALESCE((" + left + " " + op + " " + right + "), FALSE)"; }
+      return "(" + left + " " + op + " " + right + ")";
+    }
+    if (e.Kind == "And") { return "(" + Joined(e.Args, " AND ", plan, bound) + ")"; }
+    if (e.Kind == "Or") { return "(" + Joined(e.Args, " OR ", plan, bound) + ")"; }
+    if (e.Kind == "Not") {
+      negations = negations + 1;
+      var inner = Expr(e.Args[0], plan, bound);
+      negations = negations - 1;
+      return "(NOT " + inner + ")";
+    }
+    if (e.Kind == "IsNull") { return "(" + Expr(e.Args[0], plan, bound) + " IS NULL)"; }
+    if (e.Kind == "In") {
+      var target = Side(e.Args[0], plan, bound);
+      List<string> values = [];
+      var index = 0;
+      foreach (var arg in e.Args) {
+        if (index > 0) { values.Add(Expr(arg, plan, bound)); }
+        index = index + 1;
+      }
+      var inList = "(" + target + " IN (" + string.Join(", ", values) + "))";
+      // Under a NOT in the author's condition, two-valued: C#'s `!list.Contains(x)` is true for a null x.
+      if (!rule && negations % 2 == 1) { return "COALESCE(" + inList + ", FALSE)"; }
+      return inList;
+    }
+    if (e.Kind == "StartsWith" || e.Kind == "EndsWith" || e.Kind == "Contains") {
+      var text = Side(e.Args[0], plan, bound);
+      var pattern = Expr(e.Args[1], plan, bound);
+      return e.Kind.ToLower() + "(" + text + ", " + pattern + ")";
+    }
+    // Plan 1.3.
+    if (e.Kind == "Arith") {
+      var left = Expr(e.Args[0], plan, bound);
+      var right = Expr(e.Args[1], plan, bound);
+      var op = e.Op ?? "+";
+      // Databricks divides whole numbers into a double; `DIV` truncates toward zero, as C# does. A remainder keeps the sign
+      // of the number divided in both.
+      if (op == "/" && IsWhole(ExprType(e.Args[0], plan)) && IsWhole(ExprType(e.Args[1], plan))) {
+        return "(" + left + " DIV " + right + ")";
+      }
+      return "(" + left + " " + op + " " + right + ")";
+    }
+    if (e.Kind == "Call") { return CallOf(e, plan, bound); }
+    // Text joined to text: a null part is the empty string, as C#'s `+` reads it — `||` alone would null the whole.
+    if (e.Kind == "Concat") {
+      List<string> parts = [];
+      foreach (var part in e.Args) { parts.Add("COALESCE(" + Expr(part, plan, bound) + ", '')"); }
+      return "(" + string.Join(" || ", parts) + ")";
+    }
+    if (e.Kind == "Negate") { return "(-" + Expr(e.Args[0], plan, bound) + ")"; }
+    if (e.Kind == "Coalesce") { return "COALESCE(" + Joined(e.Args, ", ", plan, bound) + ")"; }
+    if (e.Kind == "Case") {
+      var condition = Expr(e.Args[0], plan, bound);
+      var then = Expr(e.Args[1], plan, bound);
+      var otherwise = Expr(e.Args[2], plan, bound);
+      return "(CASE WHEN " + condition + " THEN " + then + " ELSE " + otherwise + " END)";
+    }
+    throw new ValidationException("query plan 1.6 has no expression kind '" + e.Kind + "'.");
+  }
+
+  // A function call, each meaning what the platform's does.
+  string CallOf(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    var function = e.Function ?? "";
+    if (function == "Math.Round" && e.Args.Count == 2) { return Round(e, plan, bound); }
+    // Plan 1.4: the functions of two or three operands. Null in, null out — LEAST and GREATEST skip a null, so the null
+    // test is written out.
+    if (function == "Math.Min" || function == "Math.Max") {
+      var nulls = "(" + Expr(e.Args[0], plan, bound) + " IS NULL OR " + Expr(e.Args[1], plan, bound) + " IS NULL)";
+      var chosen = (function == "Math.Min" ? "LEAST(" : "GREATEST(") + Expr(e.Args[0], plan, bound) + ", " + Expr(e.Args[1], plan, bound) + ")";
+      return "(CASE WHEN " + nulls + " THEN NULL ELSE " + chosen + " END)";
+    }
+    if (function == "Math.Pow") {
+      // A double's answers, IEEE's: 0 to a negative power is infinity and a negative base to a fraction is NaN — written out,
+      // so no engine's own rule for them decides.
+      var zero = "CAST(" + Expr(e.Args[0], plan, bound) + " AS DOUBLE) = 0 AND CAST(" + Expr(e.Args[1], plan, bound) + " AS DOUBLE) < 0";
+      var fraction = "CAST(" + Expr(e.Args[0], plan, bound) + " AS DOUBLE) < 0 AND CAST(" + Expr(e.Args[1], plan, bound)
+        + " AS DOUBLE) <> " + Truncated("CAST(" + Expr(e.Args[1], plan, bound) + " AS DOUBLE)");
+      var power = "POWER(CAST(" + Expr(e.Args[0], plan, bound) + " AS DOUBLE), CAST(" + Expr(e.Args[1], plan, bound) + " AS DOUBLE))";
+      return "(CASE WHEN " + zero + " THEN CAST('Infinity' AS DOUBLE) WHEN " + fraction + " THEN CAST('NaN' AS DOUBLE) ELSE " + power + " END)";
+    }
+    if (function == "Math.Sqrt") {
+      var negative = "CAST(" + Expr(e.Args[0], plan, bound) + " AS DOUBLE) < 0";
+      return "(CASE WHEN " + negative + " THEN CAST('NaN' AS DOUBLE) ELSE SQRT(CAST(" + Expr(e.Args[0], plan, bound) + " AS DOUBLE)) END)";
+    }
+    if (function == "Math.Clamp") {
+      var anyNull = Expr(e.Args[0], plan, bound) + " IS NULL OR " + Expr(e.Args[1], plan, bound) + " IS NULL OR " + Expr(e.Args[2], plan, bound) + " IS NULL";
+      var ordered = Expr(e.Args[1], plan, bound) + " <= " + Expr(e.Args[2], plan, bound);
+      var clamped = "LEAST(GREATEST(" + Expr(e.Args[0], plan, bound) + ", " + Expr(e.Args[1], plan, bound) + "), " + Expr(e.Args[2], plan, bound) + ")";
+      // C# throws when min > max.
+      var failure = Failure("CONCAT('Math.Clamp needs min <= max, got min ', CAST(" + Expr(e.Args[1], plan, bound) + " AS STRING))", ExprType(e, plan));
+      return "(CASE WHEN " + anyNull + " THEN NULL WHEN " + ordered + " THEN " + clamped + " ELSE " + failure + " END)";
+    }
+    // Plan 1.4 (§12.12): date arithmetic, as C#'s DateTime does it. A whole amount is TIMESTAMPADD's own; a fraction is added as
+    // microseconds, truncated toward zero, which is what C# keeps of it in a value a column can hold. A month or a year lands
+    // on the last day of a shorter month, as C#'s AddMonths does.
+    if (function.StartsWith("Date.Add")) {
+      var unit = function.Substring(8).ToUpper();
+      unit = unit.Substring(0, unit.Length - 1);
+      if (function == "Date.AddMonths" || function == "Date.AddYears" || IsWhole(ExprType(e.Args[1], plan))) {
+        return "timestampadd(" + unit + ", " + Expr(e.Args[1], plan, bound) + ", " + Expr(e.Args[0], plan, bound) + ")";
+      }
+      var perUnit = function == "Date.AddDays" ? "86400000000" : function == "Date.AddHours" ? "3600000000"
+        : function == "Date.AddMinutes" ? "60000000" : function == "Date.AddSeconds" ? "1000000" : "1000";
+      var fraction = "CAST(" + Truncated(Expr(e.Args[1], plan, bound) + " * " + perUnit) + " AS BIGINT)";
+      return "timestampadd(MICROSECOND, " + fraction + ", " + Expr(e.Args[0], plan, bound) + ")";
+    }
+    // Plan 1.4 (§12.13): conversions, by the operand's type.
+    if (function.StartsWith("Convert.") || function.StartsWith("Cast.")) { return Conversion(e, plan, bound); }
+    // Plan 1.4 (§12.10): case by the map the plan carries — .NET's, where Databricks' own UPPER is the full mapping (`ß` → `SS`).
+    if (function == "Text.Upper" || function == "Text.Lower") {
+      if (plan.CaseMap == null) { throw new ValidationException("a plan calling " + function + " carries CaseMap — the platform's case mapping."); }
+      var upper = function == "Text.Upper";
+      return "translate(" + Expr(e.Args[0], plan, bound) + ", " + Bind(upper ? plan.CaseMap.UpperFrom : plan.CaseMap.LowerFrom, bound)
+        + ", " + Bind(upper ? plan.CaseMap.UpperTo : plan.CaseMap.LowerTo, bound) + ")";
+    }
+    // UTF-16 code units, as C#'s `string.Length`: the text's UTF-16 bytes, two to a unit. LENGTH counts code points.
+    if (function == "Text.Length") {
+      return "(octet_length(encode(" + Expr(e.Args[0], plan, bound) + ", 'UTF-16BE')) DIV 2)";
+    }
+    // Plan 1.4 (§12.9): text. The characters named, or every one .NET calls whitespace.
+    if (function == "Text.Trim" || function == "Text.TrimStart" || function == "Text.TrimEnd") {
+      var side = function == "Text.TrimStart" ? "LEADING" : function == "Text.TrimEnd" ? "TRAILING" : "BOTH";
+      var characters = e.Args.Count == 2 ? Expr(e.Args[1], plan, bound) : Bind(DotNetWhitespace, bound);
+      return "trim(" + side + " " + characters + " FROM " + Expr(e.Args[0], plan, bound) + ")";
+    }
+    if (function == "Text.Replace") {
+      // Null in, null out; an empty search string fails the read, as C# throws; otherwise REPLACE, which is ordinal.
+      var anyNull = "(" + Expr(e.Args[0], plan, bound) + " IS NULL OR " + Expr(e.Args[1], plan, bound) + " IS NULL OR "
+        + Expr(e.Args[2], plan, bound) + " IS NULL)";
+      var empty = "LENGTH(" + Expr(e.Args[1], plan, bound) + ") = 0";
+      var failure = Failure("CONCAT('Text.Replace needs a search string that is not empty, in ', " + Expr(e.Args[0], plan, bound) + ")", "string");
+      var replaced = "replace(" + Expr(e.Args[0], plan, bound) + ", " + Expr(e.Args[1], plan, bound) + ", " + Expr(e.Args[2], plan, bound) + ")";
+      return "(CASE WHEN " + anyNull + " THEN NULL WHEN " + empty + " THEN " + failure + " ELSE " + replaced + " END)";
+    }
+    // A missing string is empty and blank, as C#'s `IsNullOrEmpty` and `IsNullOrWhiteSpace` answer.
+    if (function == "Text.IsEmpty") { return "(COALESCE(" + Expr(e.Args[0], plan, bound) + ", '') = '')"; }
+    if (function == "Text.IsBlank") {
+      return "(trim(BOTH " + Bind(DotNetWhitespace, bound) + " FROM COALESCE(" + Expr(e.Args[0], plan, bound) + ", '')) = '')";
+    }
+    // The platform's pattern language escapes with a backslash, which is LIKE's own escape here; the text matches ordinally.
+    if (function == "Text.Like") { return "(" + Side(e.Args[0], plan, bound) + " LIKE " + Expr(e.Args[1], plan, bound) + ")"; }
+    if (e.Args.Count != 1) { throw new ValidationException("the Databricks translator does not call " + function + " with " + Convert.ToString(e.Args.Count) + " operands."); }
+    return Call(function, Expr(e.Args[0], plan, bound));
+  }
+
+  string Joined(List<PlanExpr> args, string separator, QueryPlan plan, List<DatabricksParameter> bound) {
+    List<string> parts = [];
+    foreach (var arg in args) { parts.Add(Expr(arg, plan, bound)); }
+    return string.Join(separator, parts);
+  }
+
+  // One side of a comparison: a string column compares ordinally.
+  string Side(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    if (e.Kind == "Column") { return Ordered(e.Name ?? "", plan, bound); }
+    // Plan 1.6: an Outer column is typed by the plan it names a row of.
+    if (e.Kind == "Outer") { return OrderedAs(Expr(e, plan, bound), e.Name ?? "", outers[outers.Count - 1]); }
+    // A computed string — a Concat, a ?? of strings, a ?: between two — compares ordinally too.
+    if (ExprType(e, plan) == "string") { return "(" + Expr(e, plan, bound) + ") COLLATE UTF8_BINARY"; }
+    return Expr(e, plan, bound);
+  }
+
+  string Ordered(string column, QueryPlan plan, List<DatabricksParameter> bound) {
+    return OrderedAs(Col(column, plan, bound), column, plan);
+  }
+
+  // A column reference, compared and ordered ordinally when the column is a string.
+  string OrderedAs(string reference, string column, QueryPlan plan) {
+    if (TypeOf(column, plan) == "string") { return reference + " COLLATE UTF8_BINARY"; }
+    return reference;
+  }
+
+  string TypeOf(string column, QueryPlan plan) {
+    foreach (var name in plan.ColumnTypes.Keys) {
+      if (name == column) { return plan.ColumnTypes[name]; }
+    }
+    return "";
+  }
+
+  // The plan type an expression answers as — which decides whether a division is of whole numbers.
+  string ExprType(PlanExpr e, QueryPlan plan) {
+    if (e.Kind == "Column") { return TypeOf(e.Name ?? "", plan); }
+    if (e.Kind == "Literal") { return e.Type ?? ""; }
+    // Plan 1.6: an Outer column's type is the enclosing plan's; a nested read answers a bool, a count or its column's type.
+    if (e.Kind == "Outer") { return TypeOf(e.Name ?? "", outers[outers.Count - 1]); }
+    if (e.Kind == "Subquery") {
+      if (e.Op == "Exists") { return "bool"; }
+      if (e.Op == "Count") { return "long"; }
+      return TypeOf(e.AggregateColumn ?? "", new QueryPlan { ColumnTypes = e.ColumnTypes });
+    }
+    if (e.Kind == "Negate") { return ExprType(e.Args[0], plan); }
+    if (e.Kind == "Call") {
+      var function = e.Function ?? "";
+      // A conversion answers its target's type, whatever it read.
+      if (function == "Convert.ToInt" || function == "Cast.ToInt") { return "int"; }
+      if (function == "Convert.ToInt64" || function == "Cast.ToLong") { return "long"; }
+      if (function == "Convert.ToDecimal" || function == "Cast.ToDecimal") { return "decimal"; }
+      if (function == "Convert.ToDouble" || function == "Cast.ToDouble") { return "double"; }
+      if (function == "Convert.ToBool") { return "bool"; }
+      if (function == "Convert.ToString") { return "string"; }
+      // A date moved, or its day, is the date's own type.
+      if (function.StartsWith("Date.Add") || function == "Date.Date") { return ExprType(e.Args[0], plan); }
+      if (function.StartsWith("Date.") || function == "Text.Length" || function == "Math.Sign") { return "int"; }
+      if (function == "Math.Pow" || function == "Math.Sqrt") { return "double"; }
+      if (function == "Math.Min" || function == "Math.Max" || function == "Math.Clamp") {
+        var widest = ExprType(e.Args[0], plan);
+        foreach (var operand in e.Args) { widest = Wider(widest, ExprType(operand, plan)); }
+        return widest;
+      }
+      if (function == "Text.IsEmpty" || function == "Text.IsBlank" || function == "Text.Like") { return "bool"; }
+      if (function.StartsWith("Text.")) { return "string"; }
+      return ExprType(e.Args[0], plan);
+    }
+    if (e.Kind == "Concat") { return "string"; }
+    // Plan 1.6: a rank or a count is whole; an average is a decimal (a double's is a double); the rest answer their value's type.
+    if (e.Kind == "Window") {
+      var windowFunction = e.Function ?? "";
+      if (windowFunction == "RowNumber" || windowFunction == "Rank" || windowFunction == "DenseRank" || windowFunction == "Count") { return "int"; }
+      if (windowFunction == "Avg") { return e.Args.Count > 0 && ExprType(e.Args[0], plan) == "double" ? "double" : "decimal"; }
+      return e.Args.Count > 0 ? ExprType(e.Args[0], plan) : "";
+    }
+    if (e.Kind == "Case") { return ExprType(e.Args[1], plan); }
+    if (e.Kind == "Coalesce") { return ExprType(e.Args[0], plan); }
+    if (e.Kind == "Arith") {
+      var left = ExprType(e.Args[0], plan);
+      var right = ExprType(e.Args[1], plan);
+      if (IsWhole(left) && IsWhole(right)) { return left == "long" || right == "long" ? "long" : "int"; }
+      return left == "double" || right == "double" ? "double" : "decimal";
+    }
+    return "";
+  }
+
+  bool IsWhole(string type) { return type == "int" || type == "long"; }
+
+  // The type two numbers widen to, as C# widens them: whole numbers stay whole, a double makes a double, anything else a decimal.
+  string Wider(string left, string right) {
+    if (IsWhole(left) && IsWhole(right)) { return left == "long" || right == "long" ? "long" : "int"; }
+    return left == "double" || right == "double" ? "double" : "decimal";
+  }
+
+  // A number truncated toward zero, as C# truncates — Databricks has no TRUNC of a number.
+  string Truncated(string number) {
+    return "(CASE WHEN " + number + " < 0 THEN CEIL(" + number + ") ELSE FLOOR(" + number + ") END)";
+  }
+
+  // What C# throws on: the statement fails with the message, whatever the session's ANSI setting. `raise_error` answers no
+  // value, so it is cast to the type of the branch it stands in for.
+  string Failure(string message, string type) {
+    return "CAST(raise_error(" + message + ") AS " + SqlType(type) + ")";
+  }
+
+  string SqlType(string type) {
+    if (type == "int") { return "INT"; }
+    if (type == "long") { return "BIGINT"; }
+    if (type == "double") { return "DOUBLE"; }
+    if (type == "bool") { return "BOOLEAN"; }
+    if (type == "string") { return "STRING"; }
+    return "DECIMAL(38, 0)";
+  }
+
+  // Plan 1.3 step 4: the functions of one operand this package declares in `Functions`, each meaning what the platform's
+  // does. A TIMESTAMP_NTZ holds the UTC wall time the platform stores, so its parts are the UTC parts; ROUND takes a decimal
+  // midpoint away from zero, as the platform does.
+  string Call(string function, string arg) {
+    if (function == "Date.Year") { return "EXTRACT(YEAR FROM " + arg + ")"; }
+    if (function == "Date.Month") { return "EXTRACT(MONTH FROM " + arg + ")"; }
+    if (function == "Date.Day") { return "EXTRACT(DAY FROM " + arg + ")"; }
+    if (function == "Date.Hour") { return "EXTRACT(HOUR FROM " + arg + ")"; }
+    if (function == "Date.Minute") { return "EXTRACT(MINUTE FROM " + arg + ")"; }
+    // Whole seconds, as C#'s Second is — EXTRACT's second carries its fraction.
+    if (function == "Date.Second") { return "FLOOR(EXTRACT(SECOND FROM " + arg + "))"; }
+    if (function == "Math.Round") { return "ROUND(" + arg + ")"; }
+    if (function == "Math.Floor") { return "FLOOR(" + arg + ")"; }
+    if (function == "Math.Ceiling") { return "CEIL(" + arg + ")"; }
+    if (function == "Math.Abs") { return "ABS(" + arg + ")"; }
+    if (function == "Math.Truncate") { return Truncated(arg); }
+    // SIGN answers a double; C#'s Math.Sign is a whole number.
+    if (function == "Math.Sign") { return "CAST(SIGN(" + arg + ") AS INT)"; }
+    // Plan 1.4 (§12.12). DAYOFWEEK is Sunday 1 to Saturday 7, so one less is C#'s numbering, Sunday 0. A day number is the
+    // calendar days since 1 January of year 1.
+    if (function == "Date.Date") { return "date_trunc('DAY', " + arg + ")"; }
+    if (function == "Date.DayOfWeek") { return "(dayofweek(" + arg + ") - 1)"; }
+    if (function == "Date.DayOfYear") { return "dayofyear(" + arg + ")"; }
+    if (function == "Date.DayNumber") { return "datediff(" + arg + ", DATE '0001-01-01')"; }
+    throw new ValidationException("the Databricks translator does not call " + function + " — it is not in this package's Functions.");
+  }
+
+  // Every character .NET's `char.IsWhiteSpace` names — what `Text.Trim` removes. trim(BOTH … FROM …) given them all
+  // removes exactly those; trim given none removes only spaces.
+  const string DotNetWhitespace = "\u0009\u000A\u000B\u000C\u000D\u0020\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000";
+
+  // Plan 1.4 (§12.13): a conversion, as Convert and the cast mean it. A number converts toward zero, and one with no place
+  // in the target fails the read, as C# fails; a Convert of null is C#'s 0, false or the empty text, where a cast of null
+  // stays null. Text is not parsed into a number here: a DECIMAL has one fixed scale, and C#'s decimal keeps what the text
+  // says, so `Convert.ToInt`, `ToInt64` and `ToDecimal` are not in this package's Functions.
+  string Conversion(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    var function = e.Function ?? "";
+    var from = ExprType(e.Args[0], plan);
+    var cast = function.StartsWith("Cast.");
+    var target = function.Substring(function.IndexOf(".") + 1);
+    if (target == "ToString") {
+      if (from == "bool") {
+        return "(CASE WHEN " + Expr(e.Args[0], plan, bound) + " THEN 'True' WHEN NOT " + Expr(e.Args[0], plan, bound) + " THEN 'False' ELSE '' END)";
+      }
+      return "COALESCE(CAST(" + Expr(e.Args[0], plan, bound) + " AS STRING), '')";
+    }
+    if (target == "ToBool") {
+      if (from == "string") {
+        return "COALESCE(lower(trim(BOTH " + Bind(DotNetWhitespace, bound) + " FROM " + Expr(e.Args[0], plan, bound) + ")) = 'true', FALSE)";
+      }
+      if (from == "bool") { return "COALESCE(" + Expr(e.Args[0], plan, bound) + ", FALSE)"; }
+      return "COALESCE(" + Expr(e.Args[0], plan, bound) + " <> 0, FALSE)";
+    }
+    if (target == "ToDouble") {
+      var real = "CAST(" + Expr(e.Args[0], plan, bound) + " AS DOUBLE)";
+      return cast ? real : "COALESCE(" + real + ", 0)";
+    }
+    if (from == "string") {
+      throw new ValidationException("the Databricks translator does not parse text as a number: " + function + " is not in this package's Functions.");
+    }
+    if (target == "ToDecimal") {
+      if (from == "double") {
+        throw new ValidationException("the Databricks translator does not convert a double to a decimal: C# keeps 15 significant digits, which this package has not measured against Databricks.");
+      }
+      // A whole number becomes C#'s decimal — a value a division then divides as decimals, never as whole numbers.
+      var exact = IsWhole(from) ? "CAST(" + Expr(e.Args[0], plan, bound) + " AS DECIMAL(38, 0))" : Expr(e.Args[0], plan, bound);
+      return cast ? exact : "COALESCE(" + exact + ", 0)";
+    }
+    var wide = target == "ToInt64" || target == "ToLong";
+    var whole = wide ? "BIGINT" : "INT";
+    // Truncated toward zero, a value fits when it is above one less than the lowest and below one more than the highest.
+    var belowLow = wide ? "-9223372036854775809" : "-2147483649";
+    var aboveHigh = wide ? "9223372036854775808" : "2147483648";
+    var unfit = "";
+    if (from == "double") {
+      unfit = "isnan(" + Expr(e.Args[0], plan, bound) + ") OR " + Expr(e.Args[0], plan, bound) + " IN (CAST('Infinity' AS DOUBLE), CAST('-Infinity' AS DOUBLE)) OR ";
+    }
+    var missing = Expr(e.Args[0], plan, bound) + " IS NULL";
+    var outside = Expr(e.Args[0], plan, bound) + " <= " + belowLow + " OR " + Expr(e.Args[0], plan, bound) + " >= " + aboveHigh;
+    var failure = Failure("CONCAT('" + function + " has no " + whole + " for ', CAST(" + Expr(e.Args[0], plan, bound) + " AS STRING))", wide ? "long" : "int");
+    var value = "CAST(" + Truncated(Expr(e.Args[0], plan, bound)) + " AS " + whole + ")";
+    return "(CASE WHEN " + missing + " THEN " + (cast ? "NULL" : "0") + " WHEN " + unfit + outside + " THEN " + failure + " ELSE " + value + " END)";
+  }
+
+  // `Math.Round(x, digits)`: ROUND to that many places, a decimal midpoint away from zero as the platform rounds, and — when
+  // the digits reach past the value's scale — the value as it is. The digits are a whole-number literal the contract has
+  // checked, written into the statement as a number; a double allows 15 of them, as C# does.
+  string Round(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    var digits = e.Args[1];
+    if (e.Function != "Math.Round" || digits.Kind != "Literal" || (digits.Type != "int" && digits.Type != "long")) {
+      throw new ValidationException("query plan 1.3 calls only Math.Round with a second operand, and its digits are a whole-number literal.");
+    }
+    var places = Convert.ToInt32(digits.Value);
+    var most = ExprType(e.Args[0], plan) == "double" ? 15 : 28;
+    if (places < 0 || places > most) {
+      throw new ValidationException("Math.Round's digits must be between 0 and " + Convert.ToString(most) + ", got " + Convert.ToString(places) + ".");
+    }
+    return "ROUND(" + Expr(e.Args[0], plan, bound) + ", " + Convert.ToString(places) + ")";
+  }
+
+  string Literal(string type, string? value, List<DatabricksParameter> bound) {
+    if (value == null || type == "null") { return "NULL"; }
+    if (type == "string" || type == "Guid") { return Bind(value, bound); }
+    if (type == "bool") { return "CAST(" + Bind(value, bound) + " AS BOOLEAN)"; }
+    if (type == "int") { return "CAST(" + Bind(value, bound) + " AS INT)"; }
+    if (type == "long") { return "CAST(" + Bind(value, bound) + " AS BIGINT)"; }
+    if (type == "decimal" || type == "bigdecimal") {
+      return "CAST(" + Bind(value, bound) + " AS DECIMAL(38, " + Convert.ToString(Scale(value)) + "))";
+    }
+    if (type == "double") { return "CAST(" + Bind(value, bound) + " AS DOUBLE)"; }
+    // A DateTime is a UTC instant written with a trailing `Z`; TIMESTAMP_NTZ holds it without one.
+    if (type == "DateTime") {
+      var text = value.EndsWith("Z") ? value.Substring(0, value.Length - 1) : value;
+      return "CAST(" + Bind(text, bound) + " AS TIMESTAMP_NTZ)";
+    }
+    if (type == "DateTimeOffset") { return "CAST(" + Bind(value, bound) + " AS TIMESTAMP)"; }
+    if (type == "DateOnly") { return "CAST(" + Bind(value, bound) + " AS DATE)"; }
+    throw new ValidationException("the Databricks translator does not bind a " + type + " value.");
+  }
+
+  // A STRING parameter under the next marker, and the marker.
+  string Bind(string value, List<DatabricksParameter> bound) {
+    var name = "p" + Convert.ToString(bound.Count);
+    bound.Add(new DatabricksParameter { Name = name, Type = "STRING", Value = value });
+    return ":" + name;
+  }
+
+  // The digits after the point, so the conversion keeps them all.
+  int Scale(string value) {
+    var dot = value.IndexOf(".");
+    if (dot < 0) { return 0; }
+    var digits = value.Length - dot - 1;
+    return digits > 37 ? 37 : digits;
+  }
+
+  // Plan 1.1 (extension_model_design §11): the root is aliased once there are joins, and each join is a LEFT JOIN over the
+  // rows its own security admits — restricted BEFORE the join, so a target the caller may not read reads as null and the
+  // row stays. A join's security is written over the target's own columns, rendered as a plan of its own.
+  string From(QueryPlan plan, List<DatabricksParameter> bound) {
+    // Plan 1.7: literal rows a plan reads in place of its table.
+    if (plan.Values.Count > 0) { return ValuesTable(plan, bound); }
+    var sql = Table(plan.Entity);
+    // Plan 1.6: a nested read names the row it is inside through that row's alias, so the root is aliased then too.
+    if (plan.Joins.Count == 0 && !Nests(plan)) { return sql; }
+    sql = sql + " AS " + Quote("r");
+    foreach (var join in plan.Joins) {
+      var source = Table(join.Entity);
+      var security = join.Security;
+      if (security != null) {
+        var own = new QueryPlan { ColumnTypes = join.ColumnTypes };
+        rule = true;
+        source = "(SELECT * FROM " + source + " WHERE " + Expr(security, own, bound) + ")";
+        rule = false;
+      }
+      if (join.Kind != null) {
+        // Plan 1.6: a join on a value — Inner, Left or Cross — matched by its condition.
+        var keyword = join.Kind == "Inner" ? " INNER JOIN " : join.Kind == "Left" ? " LEFT JOIN " : " CROSS JOIN ";
+        var onClause = join.On;
+        sql = sql + keyword + source + " AS " + Quote(join.Name) + (onClause == null ? "" : " ON " + Expr(onClause, plan, bound));
+      } else {
+        var parent = join.From ?? "r";
+        sql = sql + " LEFT JOIN " + source + " AS " + Quote(join.Name) + " ON " + Quote(parent) + "." + Quote(join.ForeignKey)
+            + " = " + Quote(join.Name) + "." + Quote(join.Key);
+      }
+    }
+    return sql;
+  }
+
+  // Plan 1.7 (§12.17): `(VALUES (…), (…)) AS `r`(`A`, `B`)` — each literal cast as the plan types it.
+  string ValuesTable(QueryPlan plan, List<DatabricksParameter> bound) {
+    List<string> columns = [];
+    foreach (var column in plan.Values[0].Cells.Keys) { columns.Add(column); }
+    List<string> rows = [];
+    foreach (var row in plan.Values) {
+      List<string> cells = [];
+      foreach (var column in columns) { cells.Add(Expr(row.Cells[column], plan, bound)); }
+      rows.Add("(" + string.Join(", ", cells) + ")");
+    }
+    List<string> quoted = [];
+    foreach (var column in columns) { quoted.Add(Quote(column)); }
+    return "(VALUES " + string.Join(", ", rows) + ") AS " + Quote("r") + "(" + string.Join(", ", quoted) + ")";
+  }
+
+  // A column as the statement names it: a computed value as its expression (plan 1.3), a joined column through its join,
+  // a root column under the root's alias once there are joins or nested reads, and bare otherwise.
+  string Col(string column, QueryPlan plan, List<DatabricksParameter> bound) {
+    // Plan 1.8: inside a merge's clauses a bare column is the row ALREADY THERE. Falling through to the read's own
+    // naming would address the rows being merged IN, and the ON clause would compare a row with itself.
+    if (merged != null) { return Quote(merged) + "." + Quote(column); }
+    if (plan.Computed.ContainsKey(column)) { return "(" + Expr(plan.Computed[column], plan, bound) + ")"; }
+    if (bare) { return Quote(column); }
+    // Plan 1.6: inside a nested read, its own entity's column under its alias — or, read through one of its joins, that join's.
+    if (aliases.Count > 0) {
+      var nestedAlias = aliases[aliases.Count - 1];
+      if (plan.JoinedColumns.ContainsKey(column)) {
+        var nestedJoined = plan.JoinedColumns[column];
+        return Quote(nestedAlias + "_" + nestedJoined.Join) + "." + Quote(nestedJoined.Column);
+      }
+      return Quote(nestedAlias) + "." + Quote(column);
+    }
+    if (plan.JoinedColumns.ContainsKey(column)) {
+      var joined = plan.JoinedColumns[column];
+      return Quote(joined.Join) + "." + Quote(joined.Column);
+    }
+    if (plan.Joins.Count > 0 || Nests(plan)) { return Quote("r") + "." + Quote(column); }
+    return Quote(column);
+  }
+
+  // Plan 1.6 (§12.16): whether the plan reads another entity anywhere in it.
+  bool Nests(QueryPlan plan) {
+    if (NestsIn(plan.Filter) || NestsIn(plan.Security) || NestsIn(plan.WriteSecurity) || NestsIn(plan.Having)) { return true; }
+    foreach (var name in plan.Computed.Keys) { if (NestsIn(plan.Computed[name])) { return true; } }
+    foreach (var column in plan.Set.Keys) { if (NestsIn(plan.Set[column])) { return true; } }
+    return false;
+  }
+
+  bool NestsIn(PlanExpr? e) {
+    if (e == null) { return false; }
+    if (e.Kind == "Subquery") { return true; }
+    foreach (var arg in e.Args) { if (NestsIn(arg)) { return true; } }
+    return false;
+  }
+
+  // Plan 1.6: another entity of this source read inside a condition — correlated with the row it is inside by its Outer
+  // columns, under that entity's own read rule, with its own alias. Its condition is its own, so the count of NOTs starts
+  // again inside it.
+  string Nested(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    subqueries = subqueries + 1;
+    var alias = "s" + Convert.ToString(subqueries);
+    var own = new QueryPlan { Entity = e.Entity ?? "", ColumnTypes = e.ColumnTypes, Joins = e.Joins, JoinedColumns = e.JoinedColumns };
+    outers.Add(plan);
+    aliases.Add(alias);
+    var outerNegations = negations;
+    negations = 0;
+    var joins = "";
+    foreach (var join in e.Joins) { joins = joins + NestedJoin(join, alias, bound); }
+    List<string> parts = [];
+    var nestedRule = e.Security;
+    if (nestedRule != null) {
+      var wasRule = rule;
+      rule = true;
+      parts.Add(Expr(nestedRule, own, bound));
+      rule = wasRule;
+    }
+    var nestedFilter = e.Filter;
+    if (nestedFilter != null) { parts.Add(Expr(nestedFilter, own, bound)); }
+    var body = " FROM " + Table(e.Entity ?? "") + " AS " + Quote(alias) + joins + (parts.Count == 0 ? "" : " WHERE " + string.Join(" AND ", parts));
+    var op = e.Op ?? "Exists";
+    var sql = "";
+    if (op == "Exists") { sql = "EXISTS (SELECT 1" + body + ")"; }
+    else if (op == "Count") { sql = "(SELECT COUNT(*)" + body + ")"; }
+    // C#'s Sum of no rows is 0; its Min and Max of none read null, as the platform's own do.
+    else if (op == "Sum") { sql = "(SELECT COALESCE(SUM(" + Col(e.AggregateColumn ?? "", own, bound) + "), 0)" + body + ")"; }
+    else { sql = "(SELECT " + (op == "Min" ? "MIN(" : "MAX(") + Ordered(e.AggregateColumn ?? "", own, bound) + ")" + body + ")"; }
+    aliases.RemoveAt(aliases.Count - 1);
+    outers.RemoveAt(outers.Count - 1);
+    negations = outerNegations;
+    return sql;
+  }
+
+  // Plan 1.6 (§12.16): a window value — FN(…) OVER (PARTITION BY … ORDER BY … ROWS BETWEEN …), its order as the plan's own (text
+  // ordinal, null lowest), an average the sum over the count of values divided as decimals.
+  string Window(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    var function = e.Function ?? "";
+    if (function == "RowNumber") { return "ROW_NUMBER()" + Over(e, plan, bound); }
+    if (function == "Rank") { return "RANK()" + Over(e, plan, bound); }
+    if (function == "DenseRank") { return "DENSE_RANK()" + Over(e, plan, bound); }
+    if (function == "Count") { return "COUNT(*)" + Over(e, plan, bound); }
+    if (e.Args.Count != 1) { throw new ValidationException("a window's " + function + " works over one value."); }
+    if (function == "Lag" || function == "Lead" || function == "Sum") {
+      return function.ToUpper() + "(" + Expr(e.Args[0], plan, bound) + ")" + Over(e, plan, bound);
+    }
+    if (function == "Min" || function == "Max") {
+      var extreme = Expr(e.Args[0], plan, bound);
+      if (ExprType(e.Args[0], plan) == "string") { extreme = "(" + extreme + ") COLLATE UTF8_BINARY"; }
+      return function.ToUpper() + "(" + extreme + ")" + Over(e, plan, bound);
+    }
+    if (function == "Avg") {
+      // Whole numbers are summed as a decimal, so the quotient is C#'s decimal average and never a double's.
+      var value = Expr(e.Args[0], plan, bound);
+      if (IsWhole(ExprType(e.Args[0], plan))) { value = "CAST(" + value + " AS DECIMAL(38, 0))"; }
+      var total = "SUM(" + value + ")" + Over(e, plan, bound);
+      var count = "COUNT(" + Expr(e.Args[0], plan, bound) + ")" + Over(e, plan, bound);
+      return "(" + total + " / NULLIF(" + count + ", 0))";
+    }
+    throw new ValidationException("query plan 1.6 has no window function '" + function + "'.");
+  }
+
+  string Over(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
+    List<string> parts = [];
+    if (e.PartitionBy.Count > 0) {
+      List<string> partitionKeys = [];
+      foreach (var key in e.PartitionBy) { partitionKeys.Add(Expr(key, plan, bound)); }
+      parts.Add("PARTITION BY " + string.Join(", ", partitionKeys));
+    }
+    if (e.WindowOrder.Count > 0) {
+      List<string> orderKeys = [];
+      foreach (var order in e.WindowOrder) {
+        var orderKey = order.Key;
+        if (orderKey == null) { throw new ValidationException("a window's order names its key."); }
+        var rendered = Expr(orderKey, plan, bound);
+        if (ExprType(orderKey, plan) == "string") { rendered = "(" + rendered + ") COLLATE UTF8_BINARY"; }
+        orderKeys.Add(rendered + (order.Descending ? " DESC NULLS LAST" : " ASC NULLS FIRST"));
+      }
+      parts.Add("ORDER BY " + string.Join(", ", orderKeys));
+    }
+    var before = e.RowsBefore;
+    var after = e.RowsAfter;
+    if (before != null || after != null) {
+      var low = before == null ? "CURRENT ROW" : FrameBound(before) + " PRECEDING";
+      var high = after == null ? "CURRENT ROW" : FrameBound(after) + " FOLLOWING";
+      parts.Add("ROWS BETWEEN " + low + " AND " + high);
+    }
+    return " OVER (" + string.Join(" ", parts) + ")";
+  }
+
+  // A window frame's bound is a count of rows, written as a number: OVER takes no parameter there.
+  string FrameBound(PlanExpr frameBound) {
+    if (frameBound.Kind != "Literal" || frameBound.Value == null) { throw new ValidationException("a window frame bound is a count of rows, sent as a whole number."); }
+    var rows = Convert.ToInt64(frameBound.Value);
+    if (rows < 0) { throw new ValidationException("a window frame bound cannot be negative."); }
+    return Convert.ToString(rows);
+  }
+
+  // Plan 1.6: a join of a nested read — a LEFT JOIN over the rows the target's own rule admits, as a root join is, its alias
+  // prefixed with the nested read's so it never meets the root's.
+  string NestedJoin(PlanJoin join, string owner, List<DatabricksParameter> bound) {
+    var source = Table(join.Entity);
+    var security = join.Security;
+    if (security != null) {
+      var targetRule = new QueryPlan { ColumnTypes = join.ColumnTypes };
+      var wasRule = rule;
+      var wasBare = bare;
+      rule = true;
+      bare = true;
+      source = "(SELECT * FROM " + source + " WHERE " + Expr(security, targetRule, bound) + ")";
+      rule = wasRule;
+      bare = wasBare;
+    }
+    var name = owner + "_" + join.Name;
+    var parent = join.From == null ? owner : owner + "_" + join.From;
+    return " LEFT JOIN " + source + " AS " + Quote(name) + " ON " + Quote(parent) + "." + Quote(join.ForeignKey) + " = "
+      + Quote(name) + "." + Quote(join.Key);
+  }
+
+  // Plan 1.2: the distinct rows as a derived table. Each column is compared ordinally inside it, so a default collation
+  // cannot merge two strings the plan calls different; order and paging then apply outside it.
+  string DistinctRows(QueryPlan plan, string table, string where, List<DatabricksParameter> bound) {
+    List<string> columns = [];
+    foreach (var column in plan.Columns) { columns.Add(OrderedAs(Col(column, plan, bound), column, plan) + " AS " + Quote(column)); }
+    return "(SELECT DISTINCT " + string.Join(", ", columns) + " FROM " + table + where + ") AS " + Quote("distinct");
+  }
+
+  bool IsAggregate(string column, QueryPlan plan) {
+    foreach (var aggregate in plan.Aggregates) { if (aggregate.Name == column) { return true; } }
+    return false;
+  }
+
+  string Table(string address) {
+    List<string> parts = [];
+    foreach (var part in address.Split('.')) { parts.Add(Quote(part)); }
+    return string.Join(".", parts);
+  }
+
+  string Quote(string identifier) {
+    return "`" + identifier.Replace("`", "``") + "`";
+  }
+}

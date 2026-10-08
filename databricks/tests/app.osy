@@ -1,0 +1,15 @@
+// The producer's test project for Osysharp.Warehouses.Databricks. The workspace is STUBBED — `Http.Post.Stub` answers each
+// statement the way the SQL Statement Execution API does — and the token is a test's own (`Secret.DatabricksToken.Stub`),
+// so every test shows the whole conversation an app has with Databricks, and none reaches a real workspace.
+app DatabricksKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Http;
+  use Osysharp.Sources;
+  use Osysharp.Warehouses.Databricks@0 {
+    egress "*.cloud.databricks.com";
+    egress "*.azuredatabricks.net";
+    egress "*.gcp.databricks.com";
+    secret "DatabricksToken";
+  }
+}

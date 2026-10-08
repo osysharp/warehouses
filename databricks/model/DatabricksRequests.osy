@@ -1,0 +1,18 @@
+namespace Osysharp.Warehouses.Databricks;
+
+/// The body of a request to the SQL Statement Execution API that runs one statement, with its results inline as JSON
+/// arrays. The request waits up to `WaitTimeout` for the statement to finish, and otherwise answers with its id so the
+/// statement can be checked on. A catalog or schema left null is not sent, so the warehouse's default applies.
+public class DatabricksStatementRequest {
+  [ExternalName("statement")] public string Statement = "";
+  [ExternalName("warehouse_id")] public string WarehouseId = "";
+  /// How long the request waits, as the API spells it: `"30s"`, from `"5s"` to `"50s"`.
+  [ExternalName("wait_timeout")] public string WaitTimeout = "30s";
+  [ExternalName("on_wait_timeout")] public string OnWaitTimeout = "CONTINUE";
+  [ExternalName("disposition")] public string Disposition = "INLINE";
+  [ExternalName("format")] public string Format = "JSON_ARRAY";
+  [ExternalName("catalog")] public string? Catalog;
+  [ExternalName("schema")] public string? Schema;
+  /// The bound values, each named by the marker the statement uses for it. Null when the statement binds none.
+  [ExternalName("parameters")] public List<DatabricksParameter>? Parameters;
+}

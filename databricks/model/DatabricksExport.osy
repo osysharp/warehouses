@@ -1,0 +1,170 @@
+namespace Osysharp.Warehouses.Databricks;
+
+using Osysharp.Exports;
+
+/// An export into a Databricks table, written through the SQL Statement Execution API. Declare it with what leaves:
+///
+///   app.Exports = [
+///     new DatabricksExport("OrdersToLakehouse") {
+///       Host = "adb-1234567890123456.7.azuredatabricks.net", WarehouseId = "abcdef1234567890",
+///       Catalog = "main", Schema = "app_exports", Table = "orders",
+///       Rows = Order.Select(o => new { o.Number, o.Total, o.PlacedAt }),
+///     },
+///   ];
+///
+/// The table holds one row per exported row: `Id`, the exported columns, `_sequence` — the change that last wrote the
+/// row — and `_deleted`. It is created when the export first delivers, and a column added to the export is added to it.
+///
+/// Each batch is one `MERGE` that writes a row only when its change is newer than the one the table holds, so a batch
+/// delivered twice changes nothing the second time. A delete sets `_deleted` rather than removing the row, so a batch
+/// delivered again cannot bring back a row deleted after it; read the table through a view that leaves those rows out.
+public class DatabricksExport : DatabricksConnection, IExportSink {
+  /// The table the export writes: `orders` in `Schema`, or `other_schema.orders`.
+  public string Table = "";
+
+  public void EnsureSchema(ExportSchema schema) {
+    var headers = Headers();
+    List<string> definitions = [];
+    foreach (var column in schema.Columns) { definitions.Add(Quote(column.Name) + " " + ColumnType(column.Type)); }
+    definitions.Add(Quote("_sequence") + " BIGINT NOT NULL");
+    definitions.Add(Quote("_deleted") + " BOOLEAN NOT NULL");
+    List<DatabricksParameter> none = [];
+    Run("CREATE TABLE IF NOT EXISTS " + Target() + " (" + string.Join(", ", definitions) + ")", none, headers);
+
+    // A table made for an earlier version of the export gains the columns added since. Databricks has no `ADD COLUMN IF
+    // NOT EXISTS`, so the table's own columns are read first, and only the missing ones are added.
+    var existing = Run("SELECT * FROM " + Target() + " LIMIT 0", none, headers);
+    List<string> have = [];
+    var manifest = existing.Manifest;
+    if (manifest != null) {
+      var described = manifest.Schema;
+      if (described != null) {
+        foreach (var column in described.Columns) { have.Add(column.Name.ToLower()); }
+      }
+    }
+    List<string> missing = [];
+    foreach (var column in schema.Columns) {
+      if (!have.Contains(column.Name.ToLower())) { missing.Add(Quote(column.Name) + " " + ColumnType(column.Type)); }
+    }
+    if (missing.Count > 0) {
+      Run("ALTER TABLE " + Target() + " ADD COLUMNS (" + string.Join(", ", missing) + ")", none, headers);
+    }
+  }
+
+  public void WriteBatch(ExportBatch batch) {
+    var changes = Latest(batch.Changes);
+    if (changes.Count == 0) { return; }
+    var columns = batch.Schema.Columns;
+    var width = columns.Count + 2;
+
+    // Every value is bound as a STRING and cast in the select list, so a decimal or an instant arrives exactly as the
+    // platform wrote it. A delete binds its key and nothing else.
+    List<DatabricksParameter> parameters = [];
+    List<string> rows = [];
+    foreach (var change in changes) {
+      var deleted = change.Op == "Delete";
+      List<string> markers = [];
+      var index = 0;
+      foreach (var column in columns) {
+        string? value = null;
+        if (index == 0) {
+          value = change.Key[0];
+        } else if (!deleted) {
+          value = change.Values[index];
+        }
+        markers.Add(Bind(parameters, value));
+        index = index + 1;
+      }
+      markers.Add(Bind(parameters, Convert.ToString(change.Sequence)));
+      markers.Add(Bind(parameters, deleted ? "true" : "false"));
+      rows.Add("(" + string.Join(", ", markers) + ")");
+    }
+
+    List<string> aliases = [];
+    var position = 1;
+    while (position <= width) {
+      aliases.Add("c" + Convert.ToString(position));
+      position = position + 1;
+    }
+    List<string> selected = [];
+    List<string> names = [];
+    List<string> sets = [];
+    List<string> inserted = [];
+    position = 1;
+    foreach (var column in columns) {
+      var name = Quote(column.Name);
+      selected.Add("CAST(v.c" + Convert.ToString(position) + " AS " + ColumnType(column.Type) + ") AS " + name);
+      names.Add(name);
+      if (position > 1) { sets.Add(name + " = s." + name); }
+      inserted.Add("s." + name);
+      position = position + 1;
+    }
+    var sequence = Quote("_sequence");
+    var deletedColumn = Quote("_deleted");
+    selected.Add("CAST(v.c" + Convert.ToString(position) + " AS BIGINT) AS " + sequence);
+    selected.Add("CAST(v.c" + Convert.ToString(position + 1) + " AS BOOLEAN) AS " + deletedColumn);
+    names.Add(sequence);
+    names.Add(deletedColumn);
+    sets.Add(sequence + " = s." + sequence);
+    sets.Add(deletedColumn + " = s." + deletedColumn);
+    inserted.Add("s." + sequence);
+    inserted.Add("s." + deletedColumn);
+    var key = Quote(columns[0].Name);
+
+    var sql = "MERGE INTO " + Target() + " AS t USING (SELECT " + string.Join(", ", selected)
+      + " FROM VALUES " + string.Join(", ", rows) + " AS v(" + string.Join(", ", aliases) + ")) AS s ON t." + key + " = s." + key
+      + " WHEN MATCHED AND s." + sequence + " > t." + sequence + " THEN UPDATE SET " + string.Join(", ", sets)
+      + " WHEN NOT MATCHED THEN INSERT (" + string.Join(", ", names) + ") VALUES (" + string.Join(", ", inserted) + ")";
+    Run(sql, parameters, Headers());
+  }
+
+  // Binds a value under the next marker and answers the marker.
+  string Bind(List<DatabricksParameter> parameters, string? value) {
+    var name = "p" + Convert.ToString(parameters.Count);
+    parameters.Add(new DatabricksParameter { Name = name, Type = "STRING", Value = value });
+    return ":" + name;
+  }
+
+  // The newest change of each row in the batch, in the order the rows first appear. A MERGE whose source holds one row
+  // twice is refused, and only the newest change of a row decides what the table holds.
+  List<ExportChange> Latest(List<ExportChange> changes) {
+    var newest = new Dictionary<string, ExportChange>();
+    List<string> order = [];
+    foreach (var change in changes) {
+      var key = change.Key[0] ?? "";
+      if (!newest.ContainsKey(key)) {
+        order.Add(key);
+        newest.Add(key, change);
+      } else if (change.Sequence > newest[key].Sequence) {
+        newest[key] = change;
+      }
+    }
+    List<ExportChange> latest = [];
+    foreach (var key in order) { latest.Add(newest[key]); }
+    return latest;
+  }
+
+  string Target() {
+    if (Table == "") {
+      throw new ExternalServiceException("DatabricksExport needs a Table — set it where the export is declared.");
+    }
+    List<string> parts = [];
+    foreach (var part in Table.Split('.')) { parts.Add(Quote(part)); }
+    return string.Join(".", parts);
+  }
+
+  // The Databricks column type a plan type is kept in. A decimal keeps 18 places after the point; a bigdecimal, whose
+  // digits can outnumber any DECIMAL's, and a time of day, which Databricks has no type for, are kept as their text. An
+  // instant with an offset is kept as the instant: Databricks' TIMESTAMP holds no offset.
+  string ColumnType(string type) {
+    if (type == "string" || type == "Guid" || type == "bigdecimal" || type == "TimeOnly" || type == "Geography") { return "STRING"; }
+    if (type == "bool") { return "BOOLEAN"; }
+    if (type == "int" || type == "long") { return "BIGINT"; }
+    if (type == "decimal") { return "DECIMAL(38,18)"; }
+    if (type == "double") { return "DOUBLE"; }
+    if (type == "DateTime") { return "TIMESTAMP_NTZ"; }
+    if (type == "DateOnly") { return "DATE"; }
+    if (type == "DateTimeOffset") { return "TIMESTAMP"; }
+    throw new ValidationException("DatabricksExport cannot keep a column of type '" + type + "'.");
+  }
+}

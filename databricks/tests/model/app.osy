@@ -1,0 +1,22 @@
+// How an app connects Databricks: the token it holds as a secret, the warehouse registered as a data source, and an entity
+// whose rows live there.
+
+using Osysharp.Sources;
+using Osysharp.Warehouses.Databricks;
+
+app.Secrets = [ new Secret("DatabricksToken") ];
+
+app.DataSources = [
+  new DatabricksSource("Lakehouse") {
+    Host = "adb-1234567890123456.7.azuredatabricks.net", WarehouseId = "wh-1", Catalog = "main", Schema = "sales"
+  }
+];
+
+/// An order kept in the lakehouse — read and changed by statements the warehouse runs.
+[DataSource(DataSource.Lakehouse), ExternalName("sales.orders")]
+entity Order {
+  [Key, ExternalName("order_id")] string Number;
+  [ExternalName("region")] string Region;
+  [ExternalName("total")] decimal Total;
+  security { allow read, update when IsAnonymous || IsAuthenticated; }
+}

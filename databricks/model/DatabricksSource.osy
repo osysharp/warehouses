@@ -1,0 +1,133 @@
+namespace Osysharp.Warehouses.Databricks;
+
+using Osysharp.Http;
+using Osysharp.Sources;
+
+/// A data source over a Databricks SQL warehouse, read through the SQL Statement Execution API. Register it under a
+/// name, and point entities at it:
+///
+///   app.DataSources = [
+///     new DatabricksSource("Lakehouse") {
+///       Host = "adb-1234567890123456.7.azuredatabricks.net", WarehouseId = "abcdef1234567890",
+///       Catalog = "main", Schema = "sales"
+///     }
+///   ];
+///
+///   [DataSource(DataSource.Lakehouse), ExternalName("sales.orders")]
+///   entity Order { [Key, ExternalName("order_id")] string Number; [ExternalName("total")] decimal Total; }
+///
+/// The workspace, the warehouse and the token are the settings every Databricks class shares — see `DatabricksConnection`.
+///
+///
+/// Every query an app writes over those entities becomes one statement — filter, read rule, grouping, order and paging
+/// included — so the warehouse returns only the rows the caller may read.
+public class DatabricksSource : DatabricksConnection, IWritableEntitySource {
+  public const QueryFeatures Pushdown = QueryFeatures.All | QueryFeatures.Joins | QueryFeatures.Distinct | QueryFeatures.Having
+    | QueryFeatures.Computed | QueryFeatures.Writes | QueryFeatures.Subqueries | QueryFeatures.SetOperations
+    | QueryFeatures.Windows | QueryFeatures.ValueJoins | QueryFeatures.Inserts
+    | QueryFeatures.PagedWrites | QueryFeatures.Percentiles;
+  /// The functions this package translates (extension_model_design §12.5). `Text.Trim`, `TrimStart` and `TrimEnd` are given
+  /// every character .NET calls whitespace; `Text.Upper` and `Text.Lower` apply the case map the plan carries — .NET's, where
+  /// Databricks' own UPPER is the full mapping (`ß` → `SS`) — and `Text.Length` counts UTF-16 units. `Convert.ToInt`,
+  /// `Convert.ToInt64` and `Convert.ToDecimal` are not among them: they read text by the platform's grammar into C#'s
+  /// decimal, whose scale is what the text says, and a Databricks DECIMAL has one fixed scale — a query calling one is
+  /// refused when the app compiles.
+  public const string Functions = "Date.Year,Date.Month,Date.Day,Date.Hour,Date.Minute,Date.Second,Math.Round,Math.Floor,Math.Ceiling,Math.Abs,Text.Trim,Text.Length,Math.Truncate,Math.Sign,Math.Min,Math.Max,Math.Pow,Math.Sqrt,Math.Clamp,Text.TrimStart,Text.TrimEnd,Text.Replace,Text.IsEmpty,Text.IsBlank,Text.Like,Text.Upper,Text.Lower,Date.AddDays,Date.AddHours,Date.AddMinutes,Date.AddSeconds,Date.AddMilliseconds,Date.AddMonths,Date.AddYears,Date.Date,Date.DayOfWeek,Date.DayOfYear,Date.DayNumber,Convert.ToDouble,Convert.ToBool,Convert.ToString,Cast.ToInt,Cast.ToLong,Cast.ToDecimal,Cast.ToDouble";
+  public const string SecurityKitVersion = "1";
+
+  public stream<SourceRow> Query(QueryPlan plan) {
+    var headers = Headers();
+    var statement = new DatabricksSql().Translate(plan);
+    var chunk = Run(statement.Sql, statement.Parameters, headers).Result;
+    while (chunk != null) {
+      foreach (var values in chunk.DataArray) { yield return new SourceRow { Values = values }; }
+      var next = chunk.NextChunkInternalLink;
+      if (next == null) {
+        chunk = null;
+      } else {
+        chunk = Chunk(next, headers);
+      }
+    }
+  }
+
+  /// Plan 1.5: one UPDATE or DELETE — the rules and the caller's condition inside it, as a read carries them — answering how
+  /// many rows the warehouse reports it changed: the `num_affected_rows` a DML statement's result carries. Plan 1.7: one
+  /// INSERT … SELECT, answered the same way.
+  public int Execute(QueryPlan plan) {
+    var statement = new DatabricksSql().Translate(plan);
+    var response = Run(statement.Sql, statement.Parameters, Headers());
+    var manifest = response.Manifest;
+    var result = response.Result;
+    if (manifest != null && result != null && result.DataArray.Count > 0) {
+      var schema = manifest.Schema;
+      if (schema != null) {
+        var index = 0;
+        foreach (var column in schema.Columns) {
+          if (column.Name == "num_affected_rows") {
+            var changed = result.DataArray[0][index];
+            if (changed != null) { return Convert.ToInt32(changed); }
+          }
+          index = index + 1;
+        }
+      }
+    }
+    throw new ExternalServiceException("Databricks answered a " + plan.Op + " with no num_affected_rows, so how many rows it changed is unknown.");
+  }
+
+  /// Every table and view in `Catalog` — in `Schema` alone when one is set — with the columns whose Databricks type a
+  /// plan can carry and each table's primary key. A column of another type (`BINARY`, `ARRAY`, `MAP`, `STRUCT`,
+  /// `VARIANT`, `INTERVAL`) is left out.
+  public SourceSchema DescribeSchema() {
+    var headers = Headers();
+    List<DatabricksParameter> parameters = [];
+    var columnsSql = "SELECT table_schema, table_name, column_name, data_type, is_nullable FROM information_schema.columns "
+                   + "WHERE table_schema <> 'information_schema'";
+    var keysSql = "SELECT k.table_schema, k.table_name, k.column_name FROM information_schema.key_column_usage k "
+                + "JOIN information_schema.table_constraints t ON t.constraint_catalog = k.constraint_catalog "
+                + "AND t.constraint_schema = k.constraint_schema AND t.constraint_name = k.constraint_name "
+                + "WHERE t.constraint_type = 'PRIMARY KEY'";
+    if (Schema != "") {
+      parameters.Add(new DatabricksParameter { Name = "schema", Type = "STRING", Value = Schema });
+      columnsSql = columnsSql + " AND table_schema = :schema";
+      keysSql = keysSql + " AND k.table_schema = :schema";
+    }
+    columnsSql = columnsSql + " ORDER BY table_schema, table_name, ordinal_position";
+
+    List<string> keys = [];
+    foreach (var row in AllRows(Run(keysSql, parameters, headers), headers)) {
+      keys.Add((row[0] ?? "") + "." + (row[1] ?? "") + "." + (row[2] ?? ""));
+    }
+
+    List<SourceTable> tables = [];
+    var current = new SourceTable();
+    foreach (var row in AllRows(Run(columnsSql, parameters, headers), headers)) {
+      var type = PlanType(row[3] ?? "");
+      if (type == null) { continue; }
+      var table = (row[0] ?? "") + "." + (row[1] ?? "");
+      if (table != current.Name) {
+        current = new SourceTable { Name = table };
+        tables.Add(current);
+      }
+      var column = row[2] ?? "";
+      current.Columns.Add(new SourceColumn {
+        Name = column, Type = type, Nullable = row[4] == "YES", Key = keys.Contains(table + "." + column),
+      });
+    }
+    return new SourceSchema { Tables = tables };
+  }
+
+  // The plan type a Databricks column's values arrive as, or null for a type a plan cannot carry.
+  string? PlanType(string dataType) {
+    var t = dataType.ToUpper();
+    if (t == "STRING") { return "string"; }
+    if (t == "BIGINT" || t == "LONG") { return "long"; }
+    if (t == "INT" || t == "INTEGER" || t == "SMALLINT" || t == "SHORT" || t == "TINYINT" || t == "BYTE") { return "int"; }
+    if (t == "DECIMAL") { return "decimal"; }
+    if (t == "DOUBLE" || t == "FLOAT") { return "double"; }
+    if (t == "BOOLEAN") { return "bool"; }
+    if (t == "DATE") { return "DateOnly"; }
+    if (t == "TIMESTAMP") { return "DateTimeOffset"; }
+    if (t == "TIMESTAMP_NTZ") { return "DateTime"; }
+    return null;
+  }
+}
