@@ -26,7 +26,7 @@ public class DatabricksSource : DatabricksConnection, IWritableEntitySource {
     | QueryFeatures.Computed | QueryFeatures.Writes | QueryFeatures.Subqueries | QueryFeatures.SetOperations
     | QueryFeatures.Windows | QueryFeatures.ValueJoins | QueryFeatures.Inserts
     | QueryFeatures.PagedWrites | QueryFeatures.Percentiles;
-  /// The functions this package translates (extension_model_design §12.5). `Text.Trim`, `TrimStart` and `TrimEnd` are given
+  /// The functions this package translates. `Text.Trim`, `TrimStart` and `TrimEnd` are given
   /// every character .NET calls whitespace; `Text.Upper` and `Text.Lower` apply the case map the plan carries — .NET's, where
   /// Databricks' own UPPER is the full mapping (`ß` → `SS`) — and `Text.Length` counts UTF-16 units. `Convert.ToInt`,
   /// `Convert.ToInt64` and `Convert.ToDecimal` are not among them: they read text by the platform's grammar into C#'s
@@ -50,8 +50,8 @@ public class DatabricksSource : DatabricksConnection, IWritableEntitySource {
     }
   }
 
-  /// Plan 1.5: one UPDATE or DELETE — the rules and the caller's condition inside it, as a read carries them — answering how
-  /// many rows the warehouse reports it changed: the `num_affected_rows` a DML statement's result carries. Plan 1.7: one
+  /// One UPDATE or DELETE — the rules and the caller's condition inside it, as a read carries them — answering how
+  /// many rows the warehouse reports it changed: the `num_affected_rows` a DML statement's result carries. One
   /// INSERT … SELECT, answered the same way.
   public int Execute(QueryPlan plan) {
     var statement = new DatabricksSql().Translate(plan);

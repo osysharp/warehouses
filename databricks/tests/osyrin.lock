@@ -24,8 +24,8 @@
     {
       "name": "Osysharp.Warehouses.Databricks",
       "kind": "package",
-      "version": "0.2.3",
-      "hash": "sha256:40910197c550a3b648b621c3d01cea964934f6539a7504aa0e39b5b78549fbdf",
+      "version": "0.2.4",
+      "hash": "sha256:12ae33a7e9920d4c1951659c0aaac9691ba03f424cb0df4005a1ae14bb68f3bb",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/databricks",
@@ -54,8 +54,10 @@
   "bridges": {
     "searched": [
       "workspace",
-      "platform",
-      "github"
+      "platform"
+    ],
+    "skipped": [
+      "github: offline \u2014 the public catalog was not searched for bridges. Run \u0060osy lock\u0060 with a network to look."
     ]
   }
 }
