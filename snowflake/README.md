@@ -83,7 +83,7 @@ cast such as `(int)o.Total` — meaning what they mean in C#: toward zero, text 
 a null converted to 0, `false` or `""`, and a value with no answer failing the query. A whole number converted to a decimal becomes a `DECFLOAT`, so an average of whole numbers read inside a
 condition — `Order.Where(o => Shipment.Where(…).Average(s => s.Count) > 3m)` — divides as decimals, never as whole numbers.
 A decimal read from text is exact to
-38 digits; whether Snowflake keeps its trailing zeros has not been measured against a live account. A double written as
+38 digits. A double written as
 text, text read as a double, and a double converted to a decimal are not translated.
 `Where(…).Update(o => { … })` and `Where(…).Delete()` — with an `OrderBy(…).Take(n)` page before them too — run as one `UPDATE` or `DELETE`, under the reading person's read
 rule and their update or delete rule, and answer the rows Snowflake's SQL API reports in `stats` (`SnowflakeSource`

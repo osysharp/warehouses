@@ -26,7 +26,7 @@ public class SnowflakeSource : SnowflakeConnection, IWritableEntitySource {
     | QueryFeatures.Computed | QueryFeatures.Writes | QueryFeatures.Subqueries | QueryFeatures.SetOperations
     | QueryFeatures.Windows | QueryFeatures.ValueJoins | QueryFeatures.Inserts
     | QueryFeatures.PagedWrites | QueryFeatures.Percentiles;
-  /// The functions this package translates (extension_model_design §12.5). `Text.Trim`, `TrimStart` and `TrimEnd` are among them — given every
+  /// The functions this package translates. `Text.Trim`, `TrimStart` and `TrimEnd` are among them — given every
   /// character .NET calls whitespace. `Text.Upper` and `Text.Lower` apply the case map the plan
   /// carries — .NET's, where Snowflake's own UPPER is the full mapping (`ß` → `SS`) — and `Text.Length` counts UTF-16 units.
   public const string Functions = "Date.Year,Date.Month,Date.Day,Date.Hour,Date.Minute,Date.Second,Math.Round,Math.Floor,Math.Ceiling,Math.Abs,Text.Trim,Math.Truncate,Math.Sign,Math.Min,Math.Max,Math.Pow,Math.Sqrt,Math.Clamp,Text.TrimStart,Text.TrimEnd,Text.Replace,Text.IsEmpty,Text.IsBlank,Text.Like,Text.Upper,Text.Lower,Text.Length,Date.AddDays,Date.AddHours,Date.AddMinutes,Date.AddSeconds,Date.AddMilliseconds,Date.AddMonths,Date.AddYears,Date.Date,Date.DayOfWeek,Date.DayOfYear,Date.DayNumber,Convert.ToInt,Convert.ToInt64,Convert.ToDecimal,Convert.ToDouble,Convert.ToBool,Convert.ToString,Cast.ToInt,Cast.ToLong,Cast.ToDecimal,Cast.ToDouble";
@@ -45,8 +45,8 @@ public class SnowflakeSource : SnowflakeConnection, IWritableEntitySource {
     }
   }
 
-  /// Plan 1.5: one UPDATE or DELETE — the rule and the caller's condition inside it, as a read carries them — answering how many
-  /// rows Snowflake reports it changed. Plan 1.7: one INSERT … SELECT, answering how many rows it reports inserted.
+  /// One UPDATE or DELETE — the rule and the caller's condition inside it, as a read carries them — answering how many
+  /// rows Snowflake reports it changed. One INSERT … SELECT, answering how many rows it reports inserted.
   public int Execute(QueryPlan plan) {
     var result = Run(new SnowflakeSql().Translate(plan), Headers());
     if (result.Stats == null) {
