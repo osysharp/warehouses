@@ -15,8 +15,8 @@
     {
       "name": "Osysharp.Observability",
       "kind": "package",
-      "version": "1.0.0",
-      "hash": "sha256:aba8df0c3a7c56cfa752ad731283a5559ba21e6b04909ce580778518fe2f7196",
+      "version": "1.0.1",
+      "hash": "sha256:240f2b9d4a764186a4511669df519ad88399cc771ed87a643089a65ec25778f3",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Observability",
