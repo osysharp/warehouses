@@ -24,8 +24,8 @@
     {
       "name": "Osysharp.Warehouses.Databricks",
       "kind": "package",
-      "version": "0.2.1",
-      "hash": "sha256:57575fb2278f1e5dfa9e89d9b88b2457bbb6ff50ad95141047ead962c3b93bae",
+      "version": "0.2.2",
+      "hash": "sha256:cc09a12cc3df9df9a39be68f8744a052a078ec1d9f046293d22f53d14c229c6d",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/databricks",
@@ -43,8 +43,8 @@
     {
       "name": "Osysharp.Observability",
       "kind": "package",
-      "version": "1.0.0",
-      "hash": "sha256:aba8df0c3a7c56cfa752ad731283a5559ba21e6b04909ce580778518fe2f7196",
+      "version": "1.0.1",
+      "hash": "sha256:240f2b9d4a764186a4511669df519ad88399cc771ed87a643089a65ec25778f3",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Observability",
@@ -54,8 +54,10 @@
   "bridges": {
     "searched": [
       "workspace",
-      "platform",
-      "github"
+      "platform"
+    ],
+    "skipped": [
+      "github: offline \u2014 the public catalog was not searched for bridges. Run \u0060osy lock\u0060 with a network to look."
     ]
   }
 }
