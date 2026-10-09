@@ -39,7 +39,7 @@ public abstract class DatabricksConnection {
           + Convert.ToString(TimeoutSeconds) + " seconds, so it was cancelled. Make the statement cheaper for the warehouse, "
           + "give it more capacity, or raise TimeoutSeconds.");
       }
-      Task.Delay(pause);
+      await Task.Delay(pause);
       if (pause.TotalSeconds < 8) { pause = pause * 2; }
       var status = Http.Get(Url("/api/2.0/sql/statements/" + id), headers);
       if (!status.IsSuccess) { throw new ExternalServiceException(Failure("a status check", status)); }
