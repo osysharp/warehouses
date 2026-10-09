@@ -24,8 +24,8 @@
     {
       "name": "Osysharp.Warehouses.Snowflake",
       "kind": "package",
-      "version": "0.2.2",
-      "hash": "sha256:dc5a309b2e1f6d2fc01d023660be94726e8b03d1fba30f4648a4f11bbeb14c62",
+      "version": "0.2.3",
+      "hash": "sha256:84f4046baa6cd6c380e68cd0f580ff330d33d2cf74cfb74252a630af797ef500",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/snowflake",
@@ -54,10 +54,8 @@
   "bridges": {
     "searched": [
       "workspace",
-      "platform"
-    ],
-    "skipped": [
-      "github: offline \u2014 the public catalog was not searched for bridges. Run \u0060osy lock\u0060 with a network to look."
+      "platform",
+      "github"
     ]
   }
 }

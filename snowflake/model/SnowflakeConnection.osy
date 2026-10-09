@@ -38,7 +38,7 @@ public abstract class SnowflakeConnection {
         throw new ExternalServiceException("Snowflake still reported a statement running a minute after its "
           + Convert.ToString(TimeoutSeconds) + "-second timeout. Raise TimeoutSeconds, or make the statement cheaper for the warehouse.");
       }
-      Task.Delay(pause);
+      await Task.Delay(pause);
       if (pause.TotalSeconds < 8) { pause = pause * 2; }
       var pending = JsonSerializer.Deserialize<SnowflakeResult>(r.Body);
       var status = pending.StatementStatusUrl ?? ("/api/v2/statements/" + (pending.StatementHandle ?? ""));
