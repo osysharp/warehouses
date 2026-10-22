@@ -409,7 +409,7 @@ public class DatabricksSql {
   // A function call, each meaning what the platform's does.
   string CallOf(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
     var function = e.Function ?? "";
-    if (function == "Math.Round" && e.Args.Count == 2) { return Round(e, plan, bound); }
+    if (function == "Math.Round" && e.Args.Count >= 2) { return Round(e, plan, bound); }
     // The functions of two or three operands. Null in, null out — LEAST and GREATEST skip a null, so the null
     // test is written out.
     if (function == "Math.Min" || function == "Math.Max") {
@@ -689,9 +689,12 @@ public class DatabricksSql {
     return "(CASE WHEN " + missing + " THEN " + (cast ? "NULL" : "0") + " WHEN " + unfit + outside + " THEN " + failure + " ELSE " + value + " END)";
   }
 
-  // `Math.Round(x, digits)`: ROUND to that many places, a decimal midpoint away from zero as the platform rounds, and — when
-  // the digits reach past the value's scale — the value as it is. The digits are a whole-number literal the contract has
-  // checked, written into the statement as a number; a double allows 15 of them, as C# does.
+  // `Math.Round(x, digits)`: ROUND to that many places, a decimal midpoint away from zero, and — when the digits reach past
+  // the value's scale — the value as it is. The digits are a whole-number literal the contract has checked, written into
+  // the statement as a number; a double allows 15 of them, as C# does.
+  // A third operand is the rounding mode, named as C#'s `MidpointRounding` member — sent only because `Functions` lists
+  // `Math.Round:<Mode>` for it. `ToEven` is what C#'s bare `Math.Round` does, and the other three are C#'s DIRECTED modes:
+  // every value, not only a midpoint, goes toward zero, down or up at that many places.
   string Round(PlanExpr e, QueryPlan plan, List<DatabricksParameter> bound) {
     var digits = e.Args[1];
     if (e.Function != "Math.Round" || digits.Kind != "Literal" || (digits.Type != "int" && digits.Type != "long")) {
@@ -702,7 +705,21 @@ public class DatabricksSql {
     if (places < 0 || places > most) {
       throw new ValidationException("Math.Round's digits must be between 0 and " + Convert.ToString(most) + ", got " + Convert.ToString(places) + ".");
     }
-    return "ROUND(" + Expr(e.Args[0], plan, bound) + ", " + Convert.ToString(places) + ")";
+    var mode = e.Args.Count == 3 ? (e.Args[2].Value ?? "") : "AwayFromZero";
+    var at = Convert.ToString(places);
+    if (mode == "AwayFromZero") { return "ROUND(" + Expr(e.Args[0], plan, bound) + ", " + at + ")"; }
+    // BROUND is ROUND with a midpoint to the even neighbour — C#'s default.
+    if (mode == "ToEven") { return "BROUND(" + Expr(e.Args[0], plan, bound) + ", " + at + ")"; }
+    // FLOOR and CEIL with a scale answer a DECIMAL; a double is read back as the double it rounds.
+    var back = ExprType(e.Args[0], plan) == "double" ? " AS DOUBLE)" : "";
+    var open = back == "" ? "" : "CAST(";
+    if (mode == "ToNegativeInfinity") { return open + "FLOOR(" + Expr(e.Args[0], plan, bound) + ", " + at + ")" + back; }
+    if (mode == "ToPositiveInfinity") { return open + "CEIL(" + Expr(e.Args[0], plan, bound) + ", " + at + ")" + back; }
+    if (mode == "ToZero") {
+      return open + "(CASE WHEN " + Expr(e.Args[0], plan, bound) + " < 0 THEN CEIL(" + Expr(e.Args[0], plan, bound) + ", " + at
+        + ") ELSE FLOOR(" + Expr(e.Args[0], plan, bound) + ", " + at + ") END)" + back;
+    }
+    throw new ValidationException("Math.Round has no rounding mode '" + mode + "'.");
   }
 
   string Literal(string type, string? value, List<DatabricksParameter> bound) {

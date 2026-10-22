@@ -32,7 +32,7 @@ public class DatabricksSource : DatabricksConnection, IWritableEntitySource {
   /// `Convert.ToInt64` and `Convert.ToDecimal` are not among them: they read text by the platform's grammar into C#'s
   /// decimal, whose scale is what the text says, and a Databricks DECIMAL has one fixed scale — a query calling one is
   /// refused when the app compiles.
-  public const string Functions = "Date.Year,Date.Month,Date.Day,Date.Hour,Date.Minute,Date.Second,Math.Round,Math.Floor,Math.Ceiling,Math.Abs,Text.Trim,Text.Length,Math.Truncate,Math.Sign,Math.Min,Math.Max,Math.Pow,Math.Sqrt,Math.Clamp,Text.TrimStart,Text.TrimEnd,Text.Replace,Text.IsEmpty,Text.IsBlank,Text.Like,Text.Upper,Text.Lower,Date.AddDays,Date.AddHours,Date.AddMinutes,Date.AddSeconds,Date.AddMilliseconds,Date.AddMonths,Date.AddYears,Date.Date,Date.DayOfWeek,Date.DayOfYear,Date.DayNumber,Convert.ToDouble,Convert.ToBool,Convert.ToString,Cast.ToInt,Cast.ToLong,Cast.ToDecimal,Cast.ToDouble";
+  public const string Functions = "Date.Year,Date.Month,Date.Day,Date.Hour,Date.Minute,Date.Second,Math.Round,Math.Round:ToEven,Math.Round:ToZero,Math.Round:ToNegativeInfinity,Math.Round:ToPositiveInfinity,Math.Floor,Math.Ceiling,Math.Abs,Text.Trim,Text.Length,Math.Truncate,Math.Sign,Math.Min,Math.Max,Math.Pow,Math.Sqrt,Math.Clamp,Text.TrimStart,Text.TrimEnd,Text.Replace,Text.IsEmpty,Text.IsBlank,Text.Like,Text.Upper,Text.Lower,Date.AddDays,Date.AddHours,Date.AddMinutes,Date.AddSeconds,Date.AddMilliseconds,Date.AddMonths,Date.AddYears,Date.Date,Date.DayOfWeek,Date.DayOfYear,Date.DayNumber,Convert.ToDouble,Convert.ToBool,Convert.ToString,Cast.ToInt,Cast.ToLong,Cast.ToDecimal,Cast.ToDouble";
   public const string SecurityKitVersion = "1";
 
   public stream<SourceRow> Query(QueryPlan plan) {
