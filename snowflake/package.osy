@@ -4,8 +4,8 @@
 //
 // It asks for one host and one secret, and an app that uses it grants them or does not compile.
 package Osysharp.Warehouses.Snowflake {
-  version "0.3.0";
-  minPlatform "0.14.0";
+  version "0.4.0";
+  minPlatform "0.15.0";
   summary     "Snowflake as a data source and an export destination: entities read from a warehouse, and changes merged into its tables.";
 
   model "model/*.osy";
